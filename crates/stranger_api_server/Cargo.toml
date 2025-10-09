@@ -1,0 +1,13 @@
+[package]
+name = "stranger-api-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+stranger-jail = { path = "../stranger_jail" }
+
+anyhow = "1.0.100"
+bollard = "0.19.3"
+tokio = { version = "1.47.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
