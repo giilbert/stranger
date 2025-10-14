@@ -1,5 +1,35 @@
-use stranger_jail::Jail;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use stranger_jail::{StrangerConfig, StrangerRuntime};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{self},
+    prelude::*,
+};
+
+#[tracing::instrument(skip(runtime))]
+async fn test_jail(runtime: &StrangerRuntime) -> anyhow::Result<()> {
+    let jail = runtime.create().await?;
+
+    let mut exec = jail.sh("/bin/sh").await?;
+    exec.input("ls\n")?;
+    exec.input("exit\n")?;
+
+    let output = exec.output();
+    tracing::info!(
+        "output:\n  {}",
+        output
+            .all()
+            .await?
+            .split('\n')
+            .map(|s| format!("  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+    );
+
+    jail.destroy().await?;
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,19 +42,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("Starting a jail...");
     let start = std::time::Instant::now();
+    let runtime = StrangerRuntime::new(StrangerConfig {})?;
 
-    let docker = bollard::Docker::connect_with_local_defaults()?;
-    let jail = Jail::new(&docker).await?;
+    tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {},
+        res = test_jail(&runtime) => {
+            if let Err(err) = res {
+                tracing::error!("error during test_jail: {:?}", err);
+            }
+        }
+    }
 
-    tracing::info!("Jail started in {:?}", start.elapsed());
-
-    tracing::info!("Running a command...");
-    jail.sh("echo hello world").await?;
-
-    jail.destroy().await?;
-    tracing::info!("Done in {:?}", start.elapsed());
+    runtime.cleanup().await?;
+    tracing::info!("done in {:?}", start.elapsed());
 
     Ok(())
 }

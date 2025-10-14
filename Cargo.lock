@@ -1031,7 +1031,10 @@ dependencies = [
  "anyhow",
  "bollard",
  "futures-util",
+ "parking_lot",
+ "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
