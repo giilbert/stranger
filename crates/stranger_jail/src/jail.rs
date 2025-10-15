@@ -21,6 +21,8 @@ use crate::runtime::StrangerRuntime;
 pub(crate) struct JailActor {
     name: String,
     status: RwLock<JailStatus>,
+
+    pub(crate) _config: JailConfig,
     pub(crate) runtime: StrangerRuntime,
 
     /// Used to signal that the jail should stop responding to events and clean up resources.
@@ -34,6 +36,34 @@ pub(crate) struct JailActor {
 pub struct Jail {
     pub(super) handle: Arc<JailActor>,
 }
+
+#[derive(Debug, Default, Clone)]
+pub struct JailConfig {
+    /// Which Docker image to use for the jail.
+    pub image: String,
+
+    /// The number of CPU shares allocated to each jail.
+    pub cpu_shares: Option<usize>,
+    /// The specific CPU cores each jail is allowed to run on, in the format accepted by Docker's
+    /// `--cpuset-cpus` option (e.g., "0-3", "0,1").
+    pub cpu_set: Option<String>,
+    /// The amount of RAM (in bytes) each jail is limited to.
+    pub memory_limit: Option<usize>,
+    /// The limit on disk read rate for each jail, in bytes per second.
+    pub disk_read_rate: Option<usize>,
+    /// The limit on disk write rate for each jail, in bytes per second.
+    pub disk_write_rate: Option<usize>,
+
+    /// Whether to enable networking inside the jail. Defaults to `false`.
+    pub enable_networking: Option<bool>,
+}
+
+const DEFAULT_CPU_SHARES: usize = 256;
+const DEFAULT_CPU_SET: &str = "0-3";
+const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024; // 512MiB
+// const DEFAULT_DISK_READ_RATE: usize = 100 * 1024 * 1024; // 100MiB/s
+// const DEFAULT_DISK_WRITE_RATE: usize = 100 * 1024 * 1024; // 100MiB/s
+const DEFAULT_ENABLE_NETWORKING: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JailStatus {
@@ -52,7 +82,7 @@ impl JailStatus {
 }
 
 impl JailActor {
-    async fn new(runtime: &StrangerRuntime) -> anyhow::Result<Self> {
+    async fn new(runtime: &StrangerRuntime, config: JailConfig) -> anyhow::Result<Self> {
         let cancellation_token = CancellationToken::new();
         let container_name = "test_container".to_string(); // TODO: change
 
@@ -65,11 +95,44 @@ impl JailActor {
                         .build(),
                 ),
                 ContainerCreateBody {
-                    image: Some("ubuntu:latest".to_string()),
+                    image: Some(config.image.clone()),
                     host_config: Some(HostConfig {
                         // `runsc` is the runtime for gVisor, which provides additional sandboxing
                         // capabilities needed for the jail.
                         runtime: Some("runsc".to_string()),
+                        auto_remove: Some(true),
+                        cpu_shares: Some(config.cpu_shares.unwrap_or(DEFAULT_CPU_SHARES) as i64),
+                        cpuset_cpus: config
+                            .cpu_set
+                            .clone()
+                            .or_else(|| Some(DEFAULT_CPU_SET.to_string())),
+                        memory: Some(config.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT) as i64),
+                        network_mode: Some(
+                            if config
+                                .enable_networking
+                                .unwrap_or(DEFAULT_ENABLE_NETWORKING)
+                            {
+                                "bridge".to_string()
+                            } else {
+                                "none".to_string()
+                            },
+                        ),
+                        // TODO: This feature of limiting block device I/O is not supported in
+                        // gVisor yet. To limit disk I/O, editing the `io.max` file in the cgroup
+                        // filesystem directly is a possible workaround.
+                        //
+                        // blkio_device_read_bps: Some(vec![ThrottleDevice {
+                        //     path: Some(runtime.config().blkio_device.clone()),
+                        //     rate: Some(
+                        //         config.disk_read_rate.unwrap_or(DEFAULT_DISK_READ_RATE) as i64
+                        //     ),
+                        // }]),
+                        // blkio_device_write_bps: Some(vec![ThrottleDevice {
+                        //     path: Some(runtime.config().blkio_device.clone()),
+                        //     rate: Some(
+                        //         config.disk_write_rate.unwrap_or(DEFAULT_DISK_WRITE_RATE) as i64
+                        //     ),
+                        // }]),
                         ..Default::default()
                     }),
                     cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
@@ -89,6 +152,7 @@ impl JailActor {
         Ok(JailActor {
             name: container_name,
             status: RwLock::new(JailStatus::Running),
+            _config: config,
             runtime: runtime.clone(),
             cancellation_token,
             destroyed_token: CancellationToken::new(),
@@ -189,8 +253,8 @@ impl JailActor {
 }
 
 impl Jail {
-    pub(crate) async fn new(runtime: &StrangerRuntime) -> anyhow::Result<Self> {
-        let actor = Arc::new(JailActor::new(runtime).await?);
+    pub(crate) async fn new(runtime: &StrangerRuntime, config: JailConfig) -> anyhow::Result<Self> {
+        let actor = Arc::new(JailActor::new(runtime, config).await?);
         tokio::spawn(actor.clone().run());
         Ok(Self { handle: actor })
     }

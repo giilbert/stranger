@@ -1,4 +1,4 @@
-use stranger_jail::{StrangerConfig, StrangerRuntime};
+use stranger_jail::{JailConfig, StrangerConfig, StrangerRuntime};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self},
@@ -7,11 +7,16 @@ use tracing_subscriber::{
 
 #[tracing::instrument(skip(runtime))]
 async fn test_jail(runtime: &StrangerRuntime) -> anyhow::Result<()> {
-    let jail = runtime.create().await?;
+    let jail = runtime
+        .create(JailConfig {
+            image: "ubuntu:latest".to_string(),
+            ..Default::default()
+        })
+        .await?;
 
-    let mut exec = jail.sh("/bin/sh").await?;
-    exec.input("ls\n")?;
-    exec.input("exit\n")?;
+    tracing::info!("created jail `{}`", jail.name());
+
+    let mut exec = jail.sh("date").await?;
 
     let output = exec.output();
     tracing::info!(
@@ -43,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let start = std::time::Instant::now();
-    let runtime = StrangerRuntime::new(StrangerConfig {})?;
+    let runtime = StrangerRuntime::new(StrangerConfig {
+        blkio_device: "/dev/nvme0".to_string(),
+    })?;
 
     tokio::select! {
         biased;

@@ -4,7 +4,6 @@ use anyhow::Context;
 use bollard::{exec::StartExecResults, secret::ExecConfig};
 use futures_util::StreamExt;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
-use tokio_util::sync::CancellationToken;
 
 use crate::{Jail, jail::JailActor};
 

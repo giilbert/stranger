@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use bollard::Docker;
 use tokio::sync::RwLock;
 
-use crate::Jail;
+use crate::{Jail, jail::JailConfig};
 
 /// A runtime for managing [`crate::Jail`] instances.
 #[derive(Debug, Clone)]
@@ -21,7 +21,11 @@ pub(crate) struct RuntimeInner {
 }
 
 #[derive(Debug, Clone)]
-pub struct StrangerConfig {}
+pub struct StrangerConfig {
+    /// The block device to limit disk I/O on (e.g., "/dev/nvme0"). This should normally be the
+    /// same device that Docker is using for its storage.
+    pub blkio_device: String,
+}
 
 impl StrangerRuntime {
     /// Constructs a new [`StrangerRuntime`] with the given configuration, connecting to the local
@@ -49,8 +53,8 @@ impl StrangerRuntime {
     }
 
     /// Create a new [`Jail`] managed by this runtime.
-    pub async fn create(&self) -> anyhow::Result<Jail> {
-        let jail = Jail::new(self).await?;
+    pub async fn create(&self, config: JailConfig) -> anyhow::Result<Jail> {
+        let jail = Jail::new(self, config).await?;
         self.inner
             .jails
             .write()
