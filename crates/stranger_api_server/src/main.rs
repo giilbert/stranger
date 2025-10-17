@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use axum::{Router, extract::State};
 use stranger_jail::{JailConfig, StrangerConfig, StrangerRuntime};
 use tracing_subscriber::{
     EnvFilter,
@@ -6,7 +9,7 @@ use tracing_subscriber::{
 };
 
 #[tracing::instrument(skip(runtime))]
-async fn test_jail(runtime: &StrangerRuntime) -> anyhow::Result<()> {
+async fn get_time_with_container(runtime: &StrangerRuntime) -> anyhow::Result<String> {
     let jail = runtime
         .create(JailConfig {
             image: "ubuntu:latest".to_string(),
@@ -18,22 +21,23 @@ async fn test_jail(runtime: &StrangerRuntime) -> anyhow::Result<()> {
 
     let mut exec = jail.sh("date").await?;
 
-    let output = exec.output();
-    tracing::info!(
-        "output:\n  {}",
-        output
-            .all()
-            .await?
-            .split('\n')
-            .map(|s| format!("  {s}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-    );
-
+    let output = exec.output().all().await?;
     jail.destroy().await?;
 
-    Ok(())
+    Ok(output)
+}
+
+pub struct AppState {
+    runtime: StrangerRuntime,
+}
+
+async fn get_date(state: State<Arc<AppState>>) -> String {
+    format!(
+        "hewwo! the date is {}",
+        get_time_with_container(&state.runtime)
+            .await
+            .unwrap_or_else(|e| format!("error: {:?}", e))
+    )
 }
 
 #[tokio::main]
@@ -47,23 +51,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let start = std::time::Instant::now();
+    tracing::info!("hello stranger!");
+
     let runtime = StrangerRuntime::new(StrangerConfig {
         blkio_device: "/dev/nvme0".to_string(),
     })?;
 
+    let state = Arc::new(AppState { runtime });
+    let app: Router<()> = Router::new()
+        .route("/date", axum::routing::get(get_date))
+        .with_state(state.clone());
+
+    let address = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;
+
+    tracing::info!("listening on {}", address.local_addr()?);
+
     tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => {},
-        res = test_jail(&runtime) => {
-            if let Err(err) = res {
-                tracing::error!("error during test_jail: {:?}", err);
-            }
-        }
-    }
+        _ = tokio::signal::ctrl_c() => {}
+        _ = axum::serve(address, app) => {}
+    };
 
-    runtime.cleanup().await?;
-    tracing::info!("done in {:?}", start.elapsed());
+    state.runtime.cleanup().await?;
+    tracing::info!("everything cleaned up! shutting down..");
 
     Ok(())
 }

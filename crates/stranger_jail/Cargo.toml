@@ -1,5 +1,5 @@
 [package]
-name = "stranger-jail"
+name = "stranger_jail"
 version = "0.1.0"
 edition = "2024"
 
