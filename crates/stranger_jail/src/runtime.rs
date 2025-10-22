@@ -1,5 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use bollard::Docker;
 use tokio::sync::RwLock;
 
@@ -16,7 +17,7 @@ pub struct StrangerRuntime {
 #[derive(Debug)]
 pub(crate) struct RuntimeInner {
     config: StrangerConfig,
-    docker: Docker,
+    docker: ArcSwap<Option<Docker>>,
     jails: RwLock<HashMap<String, crate::Jail>>,
 }
 
@@ -31,25 +32,105 @@ impl StrangerRuntime {
     /// Constructs a new [`StrangerRuntime`] with the given configuration, connecting to the local
     /// Docker daemon.
     pub fn new(config: StrangerConfig) -> anyhow::Result<Self> {
-        let docker = Docker::connect_with_local_defaults()?;
-
         Ok(Self {
             inner: Arc::new(RuntimeInner {
-                docker,
+                docker: ArcSwap::new(Arc::new(None)),
                 config,
                 jails: RwLock::new(HashMap::new()),
             }),
         })
     }
 
+    /// Create a new [`StrangerRuntime`] and wait until the Docker daemon is reachable.
+    pub async fn connect(
+        config: StrangerConfig,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<Self> {
+        let runtime = Self::new(config)?;
+        runtime.wait_for_docker(timeout).await?;
+        Ok(runtime)
+    }
+
     /// Get a reference to the Docker client.
-    pub fn docker(&self) -> &Docker {
-        &self.inner.docker
+    pub fn docker(&self) -> Docker {
+        (&*self.inner.docker.load())
+            .as_ref()
+            .as_ref()
+            .expect("docker client not initialized")
+            .clone()
     }
 
     /// Get a reference to the configuration of the runtime.
     pub fn config(&self) -> &StrangerConfig {
         &self.inner.config
+    }
+
+    /// Wait until the Docker daemon is reachable with an optional timeout.
+    ///
+    /// This method will continuously attempt to ping the Docker daemon until it succeeds.
+    #[tracing::instrument(skip(self))]
+    pub async fn wait_for_docker(&self, timeout: Option<Duration>) -> anyhow::Result<()> {
+        let start = tokio::time::Instant::now();
+
+        loop {
+            let is_connect_successful = if self.inner.docker.load().is_none() {
+                match Docker::connect_with_local_defaults() {
+                    Ok(docker) => {
+                        self.inner.docker.store(Arc::new(Some(docker)));
+                        Self::weird_hack_for_fly_cgroups_fix().await;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::trace!("failed to create Docker client: {:?}, retrying...", e);
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+
+            if !is_connect_successful {
+                tracing::trace!("waiting for Docker daemon to become reachable...",);
+
+                if let Some(timeout) = timeout {
+                    if start.elapsed() >= timeout {
+                        return Err(anyhow::anyhow!(
+                            "timed out waiting for Docker daemon to become reachable"
+                        ));
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                break Ok(());
+            }
+        }
+    }
+
+    /// FIXME: On Fly.io, the cpu.cpuset option with runsc does not work on first try.
+    ///
+    /// Running `echo 0 > /sys/fs/cgroup/cpu/docker/[insert]/cpuset.cpus` fails with permission
+    /// denied: unknown. But after creating a container with
+    /// `docker run --cpuset-cpus 0 --rm -it ubuntu /bin/bash`, it works?
+    ///
+    /// This does the same thing programmatically.
+    async fn weird_hack_for_fly_cgroups_fix() {
+        // create a temporary container to fix cgroup cpu.cpuset issue on Fly.io
+        tracing::info!("creating temporary container to fix cpu.cpuset issue");
+        let _ = tokio::process::Command::new("docker")
+            .args(&[
+                "run",
+                "--rm",
+                "--cpuset-cpus",
+                "0",
+                "--name",
+                "stranger-jail-temp-cpuset-fix",
+                "ubuntu",
+                "echo",
+                "Temporary container to fix cpu.cpuset issue",
+            ])
+            .status()
+            .await;
     }
 
     /// Create a new [`Jail`] managed by this runtime.

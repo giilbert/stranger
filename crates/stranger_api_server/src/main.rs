@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::{Router, extract::State};
+use axum::{Router, extract::State, middleware::Next};
 use stranger_jail::{JailConfig, StrangerConfig, StrangerRuntime};
 use tracing_subscriber::{
     EnvFilter,
@@ -13,6 +13,8 @@ async fn get_time_with_container(runtime: &StrangerRuntime) -> anyhow::Result<St
     let jail = runtime
         .create(JailConfig {
             image: "ubuntu:latest".to_string(),
+            cpu_set: Some("0".to_string()),
+            memory_limit: Some(128 * 1024 * 1024), // 128 MB
             ..Default::default()
         })
         .await?;
@@ -59,7 +61,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState { runtime });
     let app: Router<()> = Router::new()
+        .route("/", axum::routing::get(|| async { "hewwo stranger!" }))
         .route("/date", axum::routing::get(get_date))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<Arc<AppState>>, req, next: Next| async move {
+                state.runtime.wait_for_docker(None).await.ok();
+                next.run(req).await
+            },
+        ))
         .with_state(state.clone());
 
     let address = tokio::net::TcpListener::bind("0.0.0.0:8081").await?;

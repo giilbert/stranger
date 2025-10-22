@@ -30,7 +30,7 @@ RUN touch crates/stranger_jail/src/lib.rs
 
 RUN cargo build --release
 
-FROM docker:28.5.1-dind
+FROM docker:28.3.3-dind
 
 RUN apk add --no-cache libressl-dev ca-certificates-bundle tini bash ncurses wget
 
@@ -46,7 +46,7 @@ RUN set -e && \
 RUN /usr/local/bin/runsc install
 
 ENV DOCKER_HOST=unix:///var/run/docker.sock
-EXPOSE 8080
+EXPOSE 8081
 
 COPY --from=builder /usr/src/stranger/target/release/stranger_api_server /usr/local/bin/stranger_api_server
 

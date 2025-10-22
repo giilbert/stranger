@@ -1,0 +1,30 @@
+app = "stranger-api-server"
+primary_region = "ewr"
+
+[build]
+dockerfile = "./Dockerfile"
+
+[env]
+ENVIRONMENT = "production"
+
+[[mounts]]
+source = "stranger_docker"
+destination = "/var/lib/docker"
+initial_size = "2GB"
+
+[[vm]]
+memory = "2GB"
+cpus = 2
+
+[http_service]
+internal_port = 8081
+force_https = false
+auto_start_machines = true
+auto_stop_machines = "stop"
+auto_restart = true
+min_machines_running = 0
+
+[http_service.concurrency]
+type = "connections"
+hard_limit = 12
+soft_limit = 4
