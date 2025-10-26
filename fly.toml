@@ -11,6 +11,13 @@ ENVIRONMENT = "production"
 source = "stranger_docker"
 destination = "/var/lib/docker"
 initial_size = "2GB"
+auto_extend_size_limit = "16GB"
+
+[[mounts]]
+source = "stranger_config"
+destination = "/etc/stranger"
+initial_size = "1GB"
+auto_extend_size_limit = "1GB"
 
 [[vm]]
 memory = "2GB"

@@ -47,6 +47,7 @@ RUN /usr/local/bin/runsc install
 
 ENV DOCKER_HOST=unix:///var/run/docker.sock
 EXPOSE 8081
+VOLUME ["/var/lib/docker", "/etc/stranger"]
 
 COPY --from=builder /usr/src/stranger/target/release/stranger_api_server /usr/local/bin/stranger_api_server
 

@@ -39,7 +39,7 @@ impl JailActor {
             .runtime
             .docker()
             .create_exec(
-                self.name(),
+                &self.name(),
                 ExecConfig {
                     cmd: Some(vec!["sh".to_string(), "-c".to_string(), command.into()]),
                     attach_stdout: Some(true),

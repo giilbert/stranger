@@ -1,12 +1,14 @@
-use std::sync::Arc;
+mod state;
 
 use axum::{Router, extract::State, middleware::Next};
-use stranger_jail::{JailConfig, StrangerConfig, StrangerRuntime};
+use stranger_jail::{JailConfig, StrangerRuntime};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self},
     prelude::*,
 };
+
+use crate::state::AppState;
 
 #[tracing::instrument(skip(runtime))]
 async fn get_time_with_container(runtime: &StrangerRuntime) -> anyhow::Result<String> {
@@ -29,14 +31,10 @@ async fn get_time_with_container(runtime: &StrangerRuntime) -> anyhow::Result<St
     Ok(output)
 }
 
-pub struct AppState {
-    runtime: StrangerRuntime,
-}
-
-async fn get_date(state: State<Arc<AppState>>) -> String {
+async fn get_date(state: State<AppState>) -> String {
     format!(
         "hewwo! the date is {}",
-        get_time_with_container(&state.runtime)
+        get_time_with_container(state.runtime())
             .await
             .unwrap_or_else(|e| format!("error: {:?}", e))
     )
@@ -53,20 +51,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("hello stranger!");
-
-    let runtime = StrangerRuntime::new(StrangerConfig {
-        blkio_device: "/dev/nvme0".to_string(),
-    })?;
-
-    let state = Arc::new(AppState { runtime });
+    let state = AppState::init().await?;
     let app: Router<()> = Router::new()
         .route("/", axum::routing::get(|| async { "hewwo stranger!" }))
         .route("/date", axum::routing::get(get_date))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            |State(state): State<Arc<AppState>>, req, next: Next| async move {
-                state.runtime.wait_for_docker(None).await.ok();
+            |State(state): State<AppState>, req, next: Next| async move {
+                state.runtime().wait_for_docker(None).await.ok();
                 next.run(req).await
             },
         ))
@@ -82,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         _ = axum::serve(address, app) => {}
     };
 
-    state.runtime.cleanup().await?;
+    state.runtime().cleanup().await?;
     tracing::info!("everything cleaned up! shutting down..");
 
     Ok(())

@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use bollard::Docker;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{Jail, jail::JailConfig};
@@ -21,7 +22,7 @@ pub(crate) struct RuntimeInner {
     jails: RwLock<HashMap<String, crate::Jail>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StrangerConfig {
     /// The block device to limit disk I/O on (e.g., "/dev/nvme0"). This should normally be the
     /// same device that Docker is using for its storage.
@@ -126,8 +127,8 @@ impl StrangerRuntime {
                 "--name",
                 "stranger-jail-temp-cpuset-fix",
                 "ubuntu",
-                "echo",
-                "Temporary container to fix cpu.cpuset issue",
+                "sleep",
+                "1",
             ])
             .status()
             .await;

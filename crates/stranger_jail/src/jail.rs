@@ -9,8 +9,10 @@ use bollard::{
     secret::{ContainerCreateBody, HostConfig},
 };
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::runtime::StrangerRuntime;
 
@@ -19,7 +21,7 @@ use crate::runtime::StrangerRuntime;
 /// [`JailActor::run`] should be spawned as a background task to manage the jail's lifecycle.
 #[derive(Debug)]
 pub(crate) struct JailActor {
-    name: String,
+    id: Uuid,
     status: RwLock<JailStatus>,
 
     pub(crate) _config: JailConfig,
@@ -37,7 +39,7 @@ pub struct Jail {
     pub(super) handle: Arc<JailActor>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct JailConfig {
     /// Which Docker image to use for the jail.
     pub image: String,
@@ -81,17 +83,21 @@ impl JailStatus {
     }
 }
 
+fn name_from_id(id: &Uuid) -> String {
+    format!("stranger_jail_{}", id)
+}
+
 impl JailActor {
     async fn new(runtime: &StrangerRuntime, config: JailConfig) -> anyhow::Result<Self> {
         let cancellation_token = CancellationToken::new();
-        let container_name = "test_container".to_string(); // TODO: change
+        let id = Uuid::new_v4();
 
         runtime
             .docker()
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::new()
-                        .name(&container_name)
+                        .name(&name_from_id(&id))
                         .build(),
                 ),
                 ContainerCreateBody {
@@ -144,19 +150,23 @@ impl JailActor {
         runtime
             .docker()
             .start_container(
-                &container_name,
+                &name_from_id(&id),
                 Some(StartContainerOptionsBuilder::new().build()),
             )
             .await?;
 
         Ok(JailActor {
-            name: container_name,
+            id,
             status: RwLock::new(JailStatus::Running),
             _config: config,
             runtime: runtime.clone(),
             cancellation_token,
             destroyed_token: CancellationToken::new(),
         })
+    }
+
+    pub(crate) fn name(&self) -> String {
+        name_from_id(&self.id)
     }
 
     /// Main loop to monitor and manage the jail.
@@ -186,11 +196,11 @@ impl JailActor {
             .runtime
             .docker()
             .inspect_container(
-                self.name(),
+                &self.name(),
                 Some(InspectContainerOptionsBuilder::new().size(true).build()),
             )
             .await
-            .context(format!("failed to inspect container {}", self.name))?;
+            .context(format!("failed to inspect container {}", self.name()))?;
 
         let size = inspect
             .size_rw
@@ -199,8 +209,8 @@ impl JailActor {
 
         if size > MAX_DISK_USAGE_BYTES {
             tracing::warn!(
-                "container {} exceeded max disk usage ({} bytes > {} bytes), destroying",
-                self.name(),
+                "jail {} exceeded max disk usage ({} bytes > {} bytes), destroying",
+                self.id,
                 size,
                 MAX_DISK_USAGE_BYTES
             );
@@ -223,7 +233,7 @@ impl JailActor {
         self.runtime
             .docker()
             .remove_container(
-                &self.name,
+                &self.name(),
                 Some(
                     RemoveContainerOptionsBuilder::new()
                         .v(true)
@@ -232,19 +242,15 @@ impl JailActor {
                 ),
             )
             .await
-            .context(format!("failed to remove container {}", self.name))?;
+            .context(format!("failed to remove container {}", self.name()))?;
 
         // Wait until the `run` task has fully stopped and cleaned up resources.
         self.destroyed_token.cancelled().await;
-        self.runtime.remove(&self.name).await;
+        self.runtime.remove(&self.name()).await;
 
         *self.status.write() = JailStatus::Destroyed;
 
         Ok(())
-    }
-
-    pub(crate) fn name(&self) -> &str {
-        &self.name
     }
 
     pub(crate) fn status(&self) -> JailStatus {
@@ -260,7 +266,7 @@ impl Jail {
     }
 
     /// Get the name of the jail's underlying container.
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> String {
         self.handle.name()
     }
 
@@ -279,8 +285,8 @@ impl Drop for JailActor {
     fn drop(&mut self) {
         if *self.status.read() != JailStatus::Destroyed {
             tracing::warn!(
-                "Jail {} was not destroyed before being dropped. This may lead to resource leaks.",
-                self.name
+                "Jail `{}` was not destroyed before being dropped. This may lead to resource leaks.",
+                self.id
             );
         }
     }
