@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use axum::{Json, extract::State};
 use gc_arena::Collect;
@@ -25,9 +28,7 @@ enum AsyncCallError {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum StatelessRunResponse {
-    #[serde(rename = "Success")]
     Success { output: serde_json::Value },
-    #[serde(rename = "Error")]
     Error(StatelessRunError),
 }
 
@@ -63,6 +64,7 @@ trait AsyncCall: Sized + 'static {
 struct StatelessCallCtx<T: AsyncCall> {
     tx: mpsc::Sender<ActorCommand>,
     notify: Arc<Notify>,
+    waiters: Arc<AtomicUsize>,
     ret: oneshot::Sender<T::Ret>,
 }
 
@@ -71,6 +73,8 @@ impl<T: AsyncCall> StatelessCallCtx<T> {
     /// thread up and continue execution.
     fn finish(self, result: T::Ret) {
         let _ = self.ret.send(result);
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.notify.notify_one();
     }
 
@@ -78,8 +82,11 @@ impl<T: AsyncCall> StatelessCallCtx<T> {
     /// the command.
     fn send_with(self, f: impl FnOnce(Self) -> ActorCommand) -> Result<(), AsyncCallError> {
         let tx = self.tx.clone();
+        let waiters = self.waiters.clone();
         tx.try_send(f(self))
-            .map_err(|_| AsyncCallError::ChannelFull)
+            .map_err(|_| AsyncCallError::ChannelFull)?;
+        waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
     }
 }
 
@@ -142,6 +149,7 @@ impl<T: AsyncCall> Cmd<T> {
                 tx,
                 notify,
                 ret: ret_tx,
+                waiters: Arc::new(AtomicUsize::new(0)),
             },
             params,
         )
@@ -208,6 +216,10 @@ enum LuaExecutionError {
     SerializationError(lua::serde::LuaSerdeError),
     #[error("runtime error: {0}")]
     PiccoloError(StaticError),
+    #[error("fuel limit exceeded")]
+    FuelLimitExceeded,
+    #[error("out of memory")]
+    OutOfMemory,
 }
 
 #[derive(Clone)]
@@ -219,6 +231,8 @@ struct LuaThreadCtx {
         AtomicBool,
         mpsc::Sender<Result<serde_json::Value, LuaExecutionError>>,
     )>,
+    /// Tracks the amount of async tasks that are waiting.
+    waiters: Arc<AtomicUsize>,
     /// Notifies the Lua thread to wake up and continue execution.
     next: Arc<Notify>,
 }
@@ -228,7 +242,7 @@ impl LuaThreadCtx {
         if self
             .returned
             .0
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             tracing::warn!("Lua thread tried to return a value twice, ignoring second return");
         } else {
@@ -274,16 +288,31 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
     // TODO: Limit the amount of fuel the Lua thread can consume.
     let local_set = LocalSet::new();
     local_set.spawn_local(async move {
+        const FUEL_STEP: u64 = 4_096;
+        const MAX_FUEL: u64 = FUEL_STEP * 128;
+        const MAX_ALLOCATIONS: usize = 1 * 1024 * 1024; // 1MB
+
+        let mut fuel_used = 0;
         // Drive the Lua executor until completion, waking up on notifications.
         loop {
-            let mut fuel = Fuel::with(10_000);
+            let mut fuel = Fuel::with(FUEL_STEP as i32);
 
             let is_finished = lua.enter(|ctx| ctx.fetch(&ex).step(ctx, &mut fuel));
             if is_finished {
                 break;
             } else {
-                tracing::info!("waiting for any async operation to complete...");
-                thread.next.notified().await;
+                if thread.waiters.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    thread.next.notified().await;
+                }
+            }
+
+            fuel_used += FUEL_STEP;
+            tracing::info!("fuel used so far: {fuel_used}");
+            if fuel_used >= MAX_FUEL {
+                return thread.send_return(Err(LuaExecutionError::FuelLimitExceeded));
+            }
+            if lua.enter(|ctx| ctx.metrics().total_allocation() > MAX_ALLOCATIONS) {
+                return thread.send_return(Err(LuaExecutionError::OutOfMemory));
             }
         }
 
@@ -311,7 +340,7 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
         };
 
         let (has_returned, channel) = &*thread.returned;
-        if has_returned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if has_returned.swap(true, std::sync::atomic::Ordering::AcqRel) {
             tracing::warn!("Lua thread tried to return a value twice, ignoring second return");
         } else {
             channel
@@ -360,6 +389,7 @@ pub async fn run_stateless(
         commands: commands_tx.clone(),
         returned: Arc::new((AtomicBool::new(false), returned_tx)),
         next: Arc::new(Notify::new()),
+        waiters: Arc::new(AtomicUsize::new(0)),
     };
     std::thread::spawn(move || start_lua_thread(thread_ctx, body.instructions));
 
@@ -404,6 +434,16 @@ pub async fn run_stateless(
                     Err(LuaExecutionError::CompilerError(e)) => {
                         StatelessRunResponse::Error(StatelessRunError::ExecutionError {
                             message: format!("{e}"),
+                        })
+                    },
+                    Err(LuaExecutionError::FuelLimitExceeded) => {
+                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
+                            message: "fuel limit exceeded".to_string(),
+                        })
+                    },
+                    Err(LuaExecutionError::OutOfMemory) => {
+                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
+                            message: "out of memory".to_string(),
                         })
                     },
                     Err(LuaExecutionError::SerializationError(e)) => {
