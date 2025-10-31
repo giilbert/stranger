@@ -4,10 +4,10 @@ use axum::{Json, extract::State};
 use gc_arena::Collect;
 use piccolo::{
     BoxSequence, Callback, CallbackReturn, Closure, Context, Execution, Executor, FromMultiValue,
-    Fuel, IntoMultiValue, IntoValue, Lua, RuntimeError, Sequence, SequencePoll, Stack, StaticError,
-    Value, Variadic,
+    Fuel, IntoMultiValue, IntoValue, Lua, PrototypeError, RuntimeError, Sequence, SequencePoll,
+    Stack, StaticError, Value, Variadic,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use stranger_jail::JailConfig;
 use tokio::{
     sync::{Notify, mpsc, oneshot},
@@ -20,6 +20,29 @@ use crate::{api::lua, state::AppState};
 enum AsyncCallError {
     #[error("attempted to send a command to the actor, but the command channel was full")]
     ChannelFull,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum StatelessRunResponse {
+    #[serde(rename = "Success")]
+    Success { output: serde_json::Value },
+    #[serde(rename = "Error")]
+    Error(StatelessRunError),
+}
+
+#[derive(Debug, Serialize, thiserror::Error)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum StatelessRunError {
+    #[error("error parsing instructions")]
+    #[serde(rename = "ParsingError")]
+    ParsingError { message: String },
+    #[error("error during execution")]
+    #[serde(rename = "ExecutionError")]
+    ExecutionError { message: String },
+    #[error("time limit exceeded")]
+    #[serde(rename = "TimeLimitExceeded")]
+    TimeLimitExceeded,
 }
 
 /// Used to hook an async function into Lua via [`piccolo::Sequence`].
@@ -177,6 +200,10 @@ impl AsyncCall for ShCommand {
 
 #[derive(Debug, thiserror::Error)]
 enum LuaExecutionError {
+    #[error("error parsing Lua code: {0}")]
+    ParsingError(String),
+    #[error("error compiling Lua code: {0}")]
+    CompilerError(String),
     #[error("error serializing: {0}")]
     SerializationError(lua::serde::LuaSerdeError),
     #[error("runtime error: {0}")]
@@ -196,10 +223,27 @@ struct LuaThreadCtx {
     next: Arc<Notify>,
 }
 
+impl LuaThreadCtx {
+    pub fn send_return(&self, value: Result<serde_json::Value, LuaExecutionError>) {
+        if self
+            .returned
+            .0
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!("Lua thread tried to return a value twice, ignoring second return");
+        } else {
+            self.returned
+                .1
+                .try_send(value)
+                .expect("failed to send return value");
+        }
+    }
+}
+
 fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
     let mut lua = Lua::core();
 
-    let ex = lua.enter(|ctx| {
+    let ex = match lua.enter(|ctx| {
         let env = ctx.globals();
         env.set(
             ctx,
@@ -208,12 +252,24 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
         )
         .expect("failed to set callback");
 
-        let closure = Closure::load_with_env(ctx, None, instructions.as_bytes(), env)
-            .expect("failed to load closure");
+        let closure = match Closure::load_with_env(ctx, None, instructions.as_bytes(), env) {
+            Ok(closure) => Ok(closure),
+            Err(e) => {
+                thread.send_return(Err(match e {
+                    PrototypeError::Parser(e) => LuaExecutionError::ParsingError(e.to_string()),
+                    PrototypeError::Compiler(e) => LuaExecutionError::CompilerError(e.to_string()),
+                }));
+
+                return Err(());
+            }
+        }?;
         let ex = Executor::start(ctx, closure.into(), ());
 
-        ctx.stash(ex)
-    });
+        Ok(ctx.stash(ex))
+    }) {
+        Ok(ex) => ex,
+        Err(_) => return,
+    };
 
     // TODO: Limit the amount of fuel the Lua thread can consume.
     let local_set = LocalSet::new();
@@ -282,7 +338,10 @@ pub struct RunStatelessBody {
 
 /// POST /v1/stateless/run
 #[axum::debug_handler]
-pub async fn run_stateless(state: State<AppState>, Json(body): Json<RunStatelessBody>) -> String {
+pub async fn run_stateless(
+    state: State<AppState>,
+    Json(body): Json<RunStatelessBody>,
+) -> Json<StatelessRunResponse> {
     let (commands_tx, mut commands_rx) = mpsc::channel::<ActorCommand>(16);
 
     let container = state
@@ -333,12 +392,30 @@ pub async fn run_stateless(state: State<AppState>, Json(body): Json<RunStateless
                     }
                 }
             }
-            return_value = returned_rx.recv() => {
+            Some(return_value) = returned_rx.recv() => {
                 tracing::info!("Lua thread has finished execution with return value {return_value:?}");
                 response_value = Some(match return_value {
-                    Some(Ok(json)) => format!("stateless run completed with return value:\n{}", json),
-                    Some(Err(e)) => format!("stateless run failed with error:\n{}", e),
-                    None => "stateless run completed without return value".to_string(),
+                    Ok(json) => StatelessRunResponse::Success { output: json },
+                    Err(LuaExecutionError::ParsingError(e)) => {
+                        StatelessRunResponse::Error(StatelessRunError::ParsingError {
+                            message: format!("{e}"),
+                        })
+                    },
+                    Err(LuaExecutionError::CompilerError(e)) => {
+                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
+                            message: format!("{e}"),
+                        })
+                    },
+                    Err(LuaExecutionError::SerializationError(e)) => {
+                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
+                            message: format!("serialization error: {e}"),
+                        })
+                    },
+                    Err(LuaExecutionError::PiccoloError(e)) => {
+                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
+                            message: format!("runtime error: {e}"),
+                        })
+                    },
                 });
                 break
             }
@@ -347,7 +424,9 @@ pub async fn run_stateless(state: State<AppState>, Json(body): Json<RunStateless
     container.destroy().await.expect("failed to destroy jail");
 
     match response_value {
-        Some(val) => val,
-        None => "stateless run did not complete properly".to_string(),
+        Some(val) => Json(val),
+        None => Json(StatelessRunResponse::Error(
+            StatelessRunError::TimeLimitExceeded,
+        )),
     }
 }
