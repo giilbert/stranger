@@ -1,7 +1,8 @@
+mod api;
 mod state;
 
 use axum::{Router, extract::State, middleware::Next};
-use stranger_jail::{JailConfig, StrangerRuntime};
+use stranger_jail::StrangerRuntime;
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self},
@@ -9,36 +10,6 @@ use tracing_subscriber::{
 };
 
 use crate::state::AppState;
-
-#[tracing::instrument(skip(runtime))]
-async fn get_time_with_container(runtime: &StrangerRuntime) -> anyhow::Result<String> {
-    let jail = runtime
-        .create(JailConfig {
-            image: "ubuntu:latest".to_string(),
-            cpu_set: Some("0".to_string()),
-            memory_limit: Some(128 * 1024 * 1024), // 128 MB
-            ..Default::default()
-        })
-        .await?;
-
-    tracing::info!("created jail `{}`", jail.name());
-
-    let mut exec = jail.sh("date").await?;
-
-    let output = exec.output().all().await?;
-    jail.destroy().await?;
-
-    Ok(output)
-}
-
-async fn get_date(state: State<AppState>) -> String {
-    format!(
-        "hewwo! the date is {}",
-        get_time_with_container(state.runtime())
-            .await
-            .unwrap_or_else(|e| format!("error: {:?}", e))
-    )
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,11 +25,14 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::init().await?;
     let app: Router<()> = Router::new()
         .route("/", axum::routing::get(|| async { "hewwo stranger!" }))
-        .route("/date", axum::routing::get(get_date))
+        .merge(api::create_router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             |State(state): State<AppState>, req, next: Next| async move {
                 state.runtime().wait_for_docker(None).await.ok();
+                if dotenvy::var("FLY_APP_NAME").is_ok() {
+                    StrangerRuntime::weird_hack_for_fly_cgroups_fix().await;
+                }
                 next.run(req).await
             },
         ))

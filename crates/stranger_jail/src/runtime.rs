@@ -78,7 +78,6 @@ impl StrangerRuntime {
                 match Docker::connect_with_local_defaults() {
                     Ok(docker) => {
                         self.inner.docker.store(Arc::new(Some(docker)));
-                        Self::weird_hack_for_fly_cgroups_fix().await;
                         true
                     }
                     Err(e) => {
@@ -115,7 +114,7 @@ impl StrangerRuntime {
     /// `docker run --cpuset-cpus 0 --rm -it ubuntu /bin/bash`, it works?
     ///
     /// This does the same thing programmatically.
-    async fn weird_hack_for_fly_cgroups_fix() {
+    pub async fn weird_hack_for_fly_cgroups_fix() {
         // create a temporary container to fix cgroup cpu.cpuset issue on Fly.io
         tracing::info!("creating temporary container to fix cpu.cpuset issue");
         let _ = tokio::process::Command::new("docker")
@@ -135,13 +134,15 @@ impl StrangerRuntime {
     }
 
     /// Create a new [`Jail`] managed by this runtime.
-    pub async fn create(&self, config: JailConfig) -> anyhow::Result<Jail> {
-        let jail = Jail::new(self, config).await?;
+    pub async fn create(&self, image: String, config: JailConfig) -> anyhow::Result<Jail> {
+        let jail = Jail::new(self, image, config).await?;
+
         self.inner
             .jails
             .write()
             .await
             .insert(jail.handle.name().to_string(), jail.clone());
+
         Ok(jail)
     }
 

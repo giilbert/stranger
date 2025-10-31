@@ -17,6 +17,7 @@ pub enum JailExecOutput {
 pub struct JailExec {
     input_tx: mpsc::Sender<Vec<u8>>,
     output: Option<JailExecOutputChannel>,
+    exit_code: Arc<parking_lot::Mutex<Option<u8>>>,
 }
 
 /// A channel for receiving output from a command executed inside a [`Jail`]. [`JailExec::output`]
@@ -58,34 +59,54 @@ impl JailActor {
             .await
             .context("failed to start exec instance")?;
 
+        let exit_code = Arc::new(parking_lot::Mutex::new(None));
         let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(64);
         let (output_tx, output_rx) = mpsc::channel(64);
+
         match start_exec {
             StartExecResults::Attached {
                 mut output,
                 mut input,
             } => {
                 let actor = self.clone();
+                let exit_code_clone = exit_code.clone();
+
                 tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = actor.cancellation_token.cancelled() => break,
-                            msg = output.next() => {
-                                match actor.handle_exec_output_msg(msg, &output_tx).await {
-                                    ControlFlow::Break(_) => break,
-                                    ControlFlow::Continue(_) => { /* continue */ }
+                    let run = move || async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = actor.cancellation_token.cancelled() => break,
+                                msg = output.next() => {
+                                    match actor.handle_exec_output_msg(msg, &output_tx).await {
+                                        ControlFlow::Break(_) => break,
+                                        ControlFlow::Continue(_) => { /* continue */ }
+                                    }
+                                }
+                                Some(input_data) = input_rx.recv() => {
+                                    input
+                                        .write_all(&input_data)
+                                        .await
+                                        .context("failed to write to exec stdin")?;
                                 }
                             }
-                            Some(input_data) = input_rx.recv() => {
-                                input
-                                    .write_all(&input_data)
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        tracing::error!("failed to write to exec input: {}", e);
-                                    });
-                            }
                         }
+
+                        // Get the exit code
+                        let inspect = actor
+                            .runtime
+                            .docker()
+                            .inspect_exec(&exec_instance.id)
+                            .await
+                            .context("failed to inspect exec instance")?;
+
+                        *exit_code_clone.lock() = inspect.exit_code.map(|code| code as u8);
+
+                        Ok::<_, anyhow::Error>(())
+                    };
+
+                    if let Err(e) = run().await {
+                        tracing::error!("error in exec handling: {}", e);
                     }
                 });
             }
@@ -98,6 +119,7 @@ impl JailActor {
                 channel: output_rx,
                 line_buffer: String::new(),
             }),
+            exit_code,
         })
     }
 
@@ -163,6 +185,13 @@ impl JailExec {
         self.input_tx.try_send(str.as_bytes().to_vec())?;
         Ok(())
     }
+
+    /// Gets the exit code of the executed command, if it has finished.
+    ///
+    /// Returns [`None`] if the command is still running.
+    pub fn exit_code(&self) -> Option<u8> {
+        self.exit_code.lock().clone()
+    }
 }
 
 impl JailExecOutputChannel {
@@ -216,5 +245,19 @@ impl JailExecOutputChannel {
             all_output.push_str(&line);
         }
         Ok(all_output)
+    }
+
+    /// Receives all remaining output from the command execution, splitting stdout and stderr into
+    /// separate strings.
+    pub async fn all_split(mut self) -> Result<(String, String), JailExecError> {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        while let Some(output) = self.recv().await? {
+            match output {
+                JailExecOutput::Stdout(s) => stdout.push_str(&s),
+                JailExecOutput::Stderr(s) => stderr.push_str(&s),
+            }
+        }
+        Ok((stdout, stderr))
     }
 }

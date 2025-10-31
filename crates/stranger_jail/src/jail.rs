@@ -41,9 +41,6 @@ pub struct Jail {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct JailConfig {
-    /// Which Docker image to use for the jail.
-    pub image: String,
-
     /// The number of CPU shares allocated to each jail.
     pub cpu_shares: Option<usize>,
     /// The specific CPU cores each jail is allowed to run on, in the format accepted by Docker's
@@ -88,7 +85,11 @@ fn name_from_id(id: &Uuid) -> String {
 }
 
 impl JailActor {
-    async fn new(runtime: &StrangerRuntime, config: JailConfig) -> anyhow::Result<Self> {
+    async fn new(
+        runtime: &StrangerRuntime,
+        image: String,
+        config: JailConfig,
+    ) -> anyhow::Result<Self> {
         let cancellation_token = CancellationToken::new();
         let id = Uuid::new_v4();
 
@@ -101,7 +102,7 @@ impl JailActor {
                         .build(),
                 ),
                 ContainerCreateBody {
-                    image: Some(config.image.clone()),
+                    image: Some(image),
                     host_config: Some(HostConfig {
                         // `runsc` is the runtime for gVisor, which provides additional sandboxing
                         // capabilities needed for the jail.
@@ -259,8 +260,12 @@ impl JailActor {
 }
 
 impl Jail {
-    pub(crate) async fn new(runtime: &StrangerRuntime, config: JailConfig) -> anyhow::Result<Self> {
-        let actor = Arc::new(JailActor::new(runtime, config).await?);
+    pub(crate) async fn new(
+        runtime: &StrangerRuntime,
+        name: String,
+        config: JailConfig,
+    ) -> anyhow::Result<Self> {
+        let actor = Arc::new(JailActor::new(runtime, name, config).await?);
         tokio::spawn(actor.clone().run());
         Ok(Self { handle: actor })
     }

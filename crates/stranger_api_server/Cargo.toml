@@ -7,11 +7,16 @@ edition = "2024"
 stranger_jail = { path = "../stranger_jail" }
 
 anyhow = "1.0.100"
+axum = { version = "0.8.6", features = ["macros"] }
 bollard = "0.19.3"
 dotenvy = "0.15.7"
+gc-arena = "0.5.3"
+parking_lot = "0.12.5"
+piccolo = "0.3.3"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.8"
 tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-axum = { version = "0.8.6", features = ["macros"] }
+thiserror = "2.0.17"
+serde_json = "1.0.145"
