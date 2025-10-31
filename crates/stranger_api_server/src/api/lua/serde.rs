@@ -1,4 +1,4 @@
-use piccolo::{IntoValue, Value, table::NextValue};
+use piccolo::{Value, table::NextValue};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LuaSerdeError {
@@ -83,9 +83,6 @@ fn to_json_value_fueled<'gc>(
                 ))
             }
         }
-        // Value::UserData(user_data) => {
-        //     to_json_value_fueled(user_data.into_value(ctx), OBJECT_FUEL_COST)
-        // }
         _ => Err(LuaSerdeError::InvalidValueType(format!("{}", value))),
     }
 }

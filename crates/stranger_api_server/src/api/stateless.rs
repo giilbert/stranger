@@ -4,7 +4,8 @@ use axum::{Json, extract::State};
 use gc_arena::Collect;
 use piccolo::{
     BoxSequence, Callback, CallbackReturn, Closure, Context, Execution, Executor, FromMultiValue,
-    Fuel, IntoMultiValue, IntoValue, Lua, RuntimeError, Sequence, SequencePoll, Stack, Value,
+    Fuel, IntoMultiValue, IntoValue, Lua, RuntimeError, Sequence, SequencePoll, Stack, StaticError,
+    Value, Variadic,
 };
 use serde::Deserialize;
 use stranger_jail::JailConfig;
@@ -179,9 +180,7 @@ enum LuaExecutionError {
     #[error("error serializing: {0}")]
     SerializationError(lua::serde::LuaSerdeError),
     #[error("runtime error: {0}")]
-    RuntimeError(RuntimeError),
-    #[error("lua error: {0}")]
-    LuaError(serde_json::Value),
+    PiccoloError(StaticError),
 }
 
 #[derive(Clone)]
@@ -236,19 +235,23 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
         let return_value = match lua.enter(|ctx| {
             match ctx
                 .fetch(&ex)
-                .take_result::<Vec<Value>>(ctx)
+                .take_result::<Variadic<Vec<Value>>>(ctx)
                 .expect("executor should be in finished mode")
             {
                 Ok(vals) => Ok(vals
                     .into_iter()
-                    .map(|v| lua::serde::to_json_value(v))
+                    .map(|v| {
+                        tracing::info!("serializing return value {v:?}");
+                        lua::serde::to_json_value(v)
+                    })
                     .collect::<Result<serde_json::Value, _>>()),
-                Err(e) => Err(lua::serde::to_json_value(e.to_value(ctx))),
+                Err(e) => Err(Err(LuaExecutionError::PiccoloError(e.into_static()))),
             }
         }) {
             Ok(Ok(json)) => Ok(json),
-            Ok(Err(e)) | Err(Err(e)) => Err(LuaExecutionError::SerializationError(e)),
-            Err(Ok(err_val)) => Err(LuaExecutionError::LuaError(err_val)),
+            Ok(Err(e)) => Err(LuaExecutionError::SerializationError(e)),
+            Err(Err(e)) => Err(e),
+            Err(Ok(err_val)) => Err(LuaExecutionError::PiccoloError(err_val)),
         };
 
         let (has_returned, channel) = &*thread.returned;
@@ -301,6 +304,7 @@ pub async fn run_stateless(state: State<AppState>, Json(body): Json<RunStateless
     };
     std::thread::spawn(move || start_lua_thread(thread_ctx, body.instructions));
 
+    let mut response_value = None;
     // In the actor, wait for commands and execute them until the Lua execution is finished.
     loop {
         tokio::select! {
@@ -331,12 +335,19 @@ pub async fn run_stateless(state: State<AppState>, Json(body): Json<RunStateless
             }
             return_value = returned_rx.recv() => {
                 tracing::info!("Lua thread has finished execution with return value {return_value:?}");
-                break;
+                response_value = Some(match return_value {
+                    Some(Ok(json)) => format!("stateless run completed with return value:\n{}", json),
+                    Some(Err(e)) => format!("stateless run failed with error:\n{}", e),
+                    None => "stateless run completed without return value".to_string(),
+                });
+                break
             }
         }
     }
-
     container.destroy().await.expect("failed to destroy jail");
 
-    "stateless run completed".to_string()
+    match response_value {
+        Some(val) => val,
+        None => "stateless run did not complete properly".to_string(),
+    }
 }
