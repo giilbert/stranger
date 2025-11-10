@@ -289,7 +289,7 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
     let local_set = LocalSet::new();
     local_set.spawn_local(async move {
         const FUEL_STEP: u64 = 4_096;
-        const MAX_FUEL: u64 = FUEL_STEP * 128;
+        const MAX_FUEL: u64 = FUEL_STEP * 4096;
         const MAX_ALLOCATIONS: usize = 1 * 1024 * 1024; // 1MB
 
         let mut fuel_used = 0;
@@ -307,7 +307,7 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
             }
 
             fuel_used += FUEL_STEP;
-            tracing::info!("fuel used so far: {fuel_used}");
+            // tracing::info!("fuel used so far: {fuel_used}");
             if fuel_used >= MAX_FUEL {
                 return thread.send_return(Err(LuaExecutionError::FuelLimitExceeded));
             }
