@@ -82,10 +82,8 @@ impl<T: AsyncCall> StatelessCallCtx<T> {
     /// the command.
     fn send_with(self, f: impl FnOnce(Self) -> ActorCommand) -> Result<(), AsyncCallError> {
         let tx = self.tx.clone();
-        let waiters = self.waiters.clone();
         tx.try_send(f(self))
             .map_err(|_| AsyncCallError::ChannelFull)?;
-        waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 }
@@ -119,7 +117,7 @@ impl<'gc, T: AsyncCall> Sequence<'gc> for CmdCallInstance<T> {
                 stack.replace(ctx, ret);
                 Ok(SequencePoll::Return)
             }
-            Err(oneshot::error::TryRecvError::Empty) => Ok(piccolo::SequencePoll::Pending),
+            Err(oneshot::error::TryRecvError::Empty) => Ok(SequencePoll::Pending),
             Err(oneshot::error::TryRecvError::Closed) => Err(piccolo::Error::Runtime(
                 RuntimeError(anyhow::anyhow!("async call was cancelled").into()),
             )),
@@ -136,8 +134,7 @@ impl<T: AsyncCall> Cmd<T> {
 
     fn create_call_instance<'gc>(
         &self,
-        tx: mpsc::Sender<ActorCommand>,
-        notify: Arc<Notify>,
+        thread: &LuaThreadCtx,
         ctx: Context<'gc>,
         stack: &mut Stack<'gc, '_>,
     ) -> Result<CmdCallInstance<T>, piccolo::Error<'gc>> {
@@ -146,10 +143,10 @@ impl<T: AsyncCall> Cmd<T> {
 
         T::submit(
             StatelessCallCtx {
-                tx,
-                notify,
+                tx: thread.commands.clone(),
+                notify: thread.next.clone(),
                 ret: ret_tx,
-                waiters: Arc::new(AtomicUsize::new(0)),
+                waiters: thread.waiters.clone(),
             },
             params,
         )
@@ -166,12 +163,10 @@ impl<T: AsyncCall> Cmd<T> {
         let thread = thread.clone();
 
         Callback::from_fn(ctx, move |ctx, _, mut stack| {
-            let call_instance = self.create_call_instance(
-                thread.commands.clone(),
-                thread.next.clone(),
-                ctx,
-                &mut stack,
-            )?;
+            let call_instance = self.create_call_instance(&thread, ctx, &mut stack)?;
+            thread
+                .waiters
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
             Ok(CallbackReturn::Sequence(BoxSequence::new(
                 &ctx,
@@ -288,7 +283,7 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
     // TODO: Limit the amount of fuel the Lua thread can consume.
     let local_set = LocalSet::new();
     local_set.spawn_local(async move {
-        const FUEL_STEP: u64 = 4_096;
+        const FUEL_STEP: u64 = 256;
         const MAX_FUEL: u64 = FUEL_STEP * 4096;
         const MAX_ALLOCATIONS: usize = 1 * 1024 * 1024; // 1MB
 
@@ -298,6 +293,7 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
             let mut fuel = Fuel::with(FUEL_STEP as i32);
 
             let is_finished = lua.enter(|ctx| ctx.fetch(&ex).step(ctx, &mut fuel));
+            // tracing::info!("Lua executor stepped with fuel {FUEL_STEP}, finished: {is_finished:?}");
             if is_finished {
                 break;
             } else {
@@ -307,7 +303,6 @@ fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
             }
 
             fuel_used += FUEL_STEP;
-            // tracing::info!("fuel used so far: {fuel_used}");
             if fuel_used >= MAX_FUEL {
                 return thread.send_return(Err(LuaExecutionError::FuelLimitExceeded));
             }
@@ -393,6 +388,8 @@ pub async fn run_stateless(
     };
     std::thread::spawn(move || start_lua_thread(thread_ctx, body.instructions));
 
+    let mut tasks = tokio::task::JoinSet::new();
+
     let mut response_value = None;
     // In the actor, wait for commands and execute them until the Lua execution is finished.
     loop {
@@ -400,21 +397,24 @@ pub async fn run_stateless(
             command = commands_rx.recv() => {
                 match command {
                     Some(ActorCommand::Sh { command, ctx }) => {
-                        tracing::info!("received Sh command, executing...");
-                        let mut exec = container
-                            .sh(command)
-                            .await
-                            .expect("failed to create sh exec");
-                        let (stdout, stderr) = exec
-                            .output()
-                            .all_split()
-                            .await
-                            .expect("failed to get output from sh exec");
-                        let exit_code = exec.exit_code().expect("failed to get exit code");
+                        let container = container.clone();
+                        tasks.spawn(async move {
+                            tracing::info!("received Sh command, executing...");
+                            let mut exec = container
+                                .sh(command)
+                                .await
+                                .expect("failed to create sh exec");
+                            let (stdout, stderr) = exec
+                                .output()
+                                .all_split()
+                                .await
+                                .expect("failed to get output from sh exec");
+                            let exit_code = exec.exit_code().expect("failed to get exit code");
 
-                        tracing::info!("sh command completed with exit code {}", exit_code);
+                            tracing::info!("sh command completed with exit code {}", exit_code);
 
-                        ctx.finish((exit_code, stdout, stderr));
+                            ctx.finish((exit_code, stdout, stderr));
+                        });
                     }
                     None => {
                         tracing::info!("command channel closed, exiting actor loop");
@@ -462,6 +462,7 @@ pub async fn run_stateless(
         }
     }
     container.destroy().await.expect("failed to destroy jail");
+    tasks.shutdown().await;
 
     match response_value {
         Some(val) => Json(val),
