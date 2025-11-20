@@ -1,0 +1,6 @@
+[package]
+name = "stranger_api_server_worker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

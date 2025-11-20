@@ -1,359 +1,72 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize},
-};
+use std::{cell::RefCell, rc::Rc};
 
+use anyhow::Context;
 use axum::{Json, extract::State};
-use gc_arena::Collect;
-use piccolo::{
-    BoxSequence, Callback, CallbackReturn, Closure, Context, Execution, Executor, FromMultiValue,
-    Fuel, IntoMultiValue, IntoValue, Lua, PrototypeError, RuntimeError, Sequence, SequencePoll,
-    Stack, StaticError, Value, Variadic,
+use deno_core::{
+    JsRuntime, ModuleSpecifier, OpDecl, OpState, PollEventLoopOptions, RuntimeOptions,
+    error::CoreErrorKind,
+    v8::{CreateParams, OomDetails},
 };
 use serde::{Deserialize, Serialize};
-use stranger_jail::JailConfig;
-use tokio::{
-    sync::{Notify, mpsc, oneshot},
-    task::LocalSet,
-};
+use stranger_jail::{Jail, JailConfig, StrangerRuntime};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
-use crate::{api::lua, state::AppState};
-
-#[derive(Debug, thiserror::Error)]
-enum AsyncCallError {
-    #[error("attempted to send a command to the actor, but the command channel was full")]
-    ChannelFull,
-}
+use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum StatelessRunResponse {
-    Success { output: serde_json::Value },
+    Success(StatelessRunSuccess),
     Error(StatelessRunError),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatelessRunSuccess {
+    pub output: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, thiserror::Error)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StatelessRunError {
+    #[error("unable to create jail")]
+    #[serde(rename = "JAIL_CREATION_ERROR")]
+    JailCreationError,
     #[error("error parsing instructions")]
-    #[serde(rename = "ParsingError")]
+    #[serde(rename = "PARSE_ERROR")]
     ParsingError { message: String },
     #[error("error during execution")]
-    #[serde(rename = "ExecutionError")]
+    #[serde(rename = "EXECUTION_ERROR")]
     ExecutionError { message: String },
     #[error("time limit exceeded")]
-    #[serde(rename = "TimeLimitExceeded")]
+    #[serde(rename = "TIME_LIMIT_EXCEEDED")]
     TimeLimitExceeded,
+    #[error("unknown error")]
+    #[serde(rename = "UNKNOWN")]
+    Unknown,
 }
 
-/// Used to hook an async function into Lua via [`piccolo::Sequence`].
-trait AsyncCall: Sized + 'static {
-    type Params: Send + for<'gc> FromMultiValue<'gc>;
-    type Ret: Send + for<'gc> IntoMultiValue<'gc>;
-
-    /// Submits an async function call.
-    ///
-    /// The implementor should send the result back via the provided [`oneshot::Sender`].
-    fn submit(ctx: StatelessCallCtx<Self>, params: Self::Params) -> Result<(), AsyncCallError>;
-}
-
-/// Context passed into [`AsyncCall::submit`].
-///
-/// The caller should interface with the container's actor using the provided MPSC channel.
-#[derive(Debug)]
-struct StatelessCallCtx<T: AsyncCall> {
-    tx: mpsc::Sender<ActorCommand>,
-    notify: Arc<Notify>,
-    waiters: Arc<AtomicUsize>,
-    ret: oneshot::Sender<T::Ret>,
-}
-
-impl<T: AsyncCall> StatelessCallCtx<T> {
-    /// Returns the result of the async call. This notifies the driver of the Lua thread to wake the
-    /// thread up and continue execution.
-    fn finish(self, result: T::Ret) {
-        let _ = self.ret.send(result);
-        self.waiters
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        self.notify.notify_one();
+impl StatelessRunError {
+    /// Create an [`Option::ok_or_else`] closure that logs the unknown error.
+    pub fn ok_or_else(message: &'static str) -> impl FnOnce() -> Self {
+        move || {
+            tracing::error!("unknown error: `{message}`");
+            StatelessRunError::Unknown
+        }
     }
 
-    /// Sends a command to the actor with the provided function to consume the context and create
-    /// the command.
-    fn send_with(self, f: impl FnOnce(Self) -> ActorCommand) -> Result<(), AsyncCallError> {
-        let tx = self.tx.clone();
-        tx.try_send(f(self))
-            .map_err(|_| AsyncCallError::ChannelFull)?;
-        Ok(())
-    }
-}
-
-/// A Lua function that calls an async function in Rust.
-struct Cmd<T: AsyncCall> {
-    _phantom: std::marker::PhantomData<T>,
-}
-
-/// An instance of an async command call in Lua.
-struct CmdCallInstance<T: AsyncCall> {
-    ret: oneshot::Receiver<T::Ret>,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-unsafe impl<T: AsyncCall> Collect for CmdCallInstance<T> {
-    fn trace(&self, _cc: &gc_arena::Collection) {
-        // No-op---this object does not contain any GC-managed references.
-    }
-}
-
-impl<'gc, T: AsyncCall> Sequence<'gc> for CmdCallInstance<T> {
-    fn poll(
-        &mut self,
-        ctx: Context<'gc>,
-        _exec: Execution<'gc, '_>,
-        mut stack: Stack<'gc, '_>,
-    ) -> Result<SequencePoll<'gc>, piccolo::Error<'gc>> {
-        match self.ret.try_recv() {
-            Ok(ret) => {
-                stack.replace(ctx, ret);
-                Ok(SequencePoll::Return)
-            }
-            Err(oneshot::error::TryRecvError::Empty) => Ok(SequencePoll::Pending),
-            Err(oneshot::error::TryRecvError::Closed) => Err(piccolo::Error::Runtime(
-                RuntimeError(anyhow::anyhow!("async call was cancelled").into()),
-            )),
+    /// Creates an [`Result::map_err`] closure that logs the unknown error.
+    pub fn map_err<T: std::error::Error>(message: &'static str) -> impl FnOnce(T) -> Self {
+        move |err: T| {
+            tracing::error!("unknown error: `{message}`\n{err:?}");
+            StatelessRunError::Unknown
         }
     }
 }
 
-impl<T: AsyncCall> Cmd<T> {
-    fn new() -> Self {
-        Cmd {
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    fn create_call_instance<'gc>(
-        &self,
-        thread: &LuaThreadCtx,
-        ctx: Context<'gc>,
-        stack: &mut Stack<'gc, '_>,
-    ) -> Result<CmdCallInstance<T>, piccolo::Error<'gc>> {
-        let (ret_tx, ret) = oneshot::channel();
-        let params = stack.consume::<T::Params>(ctx)?;
-
-        T::submit(
-            StatelessCallCtx {
-                tx: thread.commands.clone(),
-                notify: thread.next.clone(),
-                ret: ret_tx,
-                waiters: thread.waiters.clone(),
-            },
-            params,
-        )
-        .map_err(|e| format!("{e:?}").into_value(ctx))?;
-
-        Ok(CmdCallInstance {
-            ret,
-            _phantom: std::marker::PhantomData,
-        })
-    }
-
-    /// Creates a Lua callback that invokes this command.
-    fn into_callback<'gc>(self, thread: &LuaThreadCtx, ctx: &Context<'gc>) -> Callback<'gc> {
-        let thread = thread.clone();
-
-        Callback::from_fn(ctx, move |ctx, _, mut stack| {
-            let call_instance = self.create_call_instance(&thread, ctx, &mut stack)?;
-            thread
-                .waiters
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
-            Ok(CallbackReturn::Sequence(BoxSequence::new(
-                &ctx,
-                call_instance,
-            )))
-        })
-    }
-}
-
-/// An asynchronous command sent to an actor driving a container. The actor will interact with the
-/// Lua runtime via the provided context (see [`StatelessCallCtx`]).
-#[derive(Debug)]
-enum ActorCommand {
-    Sh {
-        command: String,
-        ctx: StatelessCallCtx<ShCommand>,
-    },
-}
-
-#[derive(Debug)]
-struct ShCommand;
-
-impl AsyncCall for ShCommand {
-    type Params = (String,);
-    type Ret = (u8, String, String); // (exit_code, stdout, stderr)
-
-    fn submit(ctx: StatelessCallCtx<Self>, params: Self::Params) -> Result<(), AsyncCallError> {
-        ctx.send_with(|ctx| ActorCommand::Sh {
-            command: params.0,
-            ctx,
-        })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum LuaExecutionError {
-    #[error("error parsing Lua code: {0}")]
-    ParsingError(String),
-    #[error("error compiling Lua code: {0}")]
-    CompilerError(String),
-    #[error("error serializing: {0}")]
-    SerializationError(lua::serde::LuaSerdeError),
-    #[error("runtime error: {0}")]
-    PiccoloError(StaticError),
-    #[error("fuel limit exceeded")]
-    FuelLimitExceeded,
-    #[error("out of memory")]
-    OutOfMemory,
-}
-
-#[derive(Clone)]
-struct LuaThreadCtx {
-    /// Used to send commands to the container's actor.
-    commands: mpsc::Sender<ActorCommand>,
-    /// Notifies the driver of the thread that all execution has finished with a value.
-    returned: Arc<(
-        AtomicBool,
-        mpsc::Sender<Result<serde_json::Value, LuaExecutionError>>,
-    )>,
-    /// Tracks the amount of async tasks that are waiting.
-    waiters: Arc<AtomicUsize>,
-    /// Notifies the Lua thread to wake up and continue execution.
-    next: Arc<Notify>,
-}
-
-impl LuaThreadCtx {
-    pub fn send_return(&self, value: Result<serde_json::Value, LuaExecutionError>) {
-        if self
-            .returned
-            .0
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            tracing::warn!("Lua thread tried to return a value twice, ignoring second return");
-        } else {
-            self.returned
-                .1
-                .try_send(value)
-                .expect("failed to send return value");
-        }
-    }
-}
-
-fn start_lua_thread(thread: LuaThreadCtx, instructions: String) {
-    let mut lua = Lua::core();
-
-    let ex = match lua.enter(|ctx| {
-        let env = ctx.globals();
-        env.set(
-            ctx,
-            "sh",
-            Cmd::<ShCommand>::new().into_callback(&thread, &ctx),
-        )
-        .expect("failed to set callback");
-
-        let closure = match Closure::load_with_env(ctx, None, instructions.as_bytes(), env) {
-            Ok(closure) => Ok(closure),
-            Err(e) => {
-                thread.send_return(Err(match e {
-                    PrototypeError::Parser(e) => LuaExecutionError::ParsingError(e.to_string()),
-                    PrototypeError::Compiler(e) => LuaExecutionError::CompilerError(e.to_string()),
-                }));
-
-                return Err(());
-            }
-        }?;
-        let ex = Executor::start(ctx, closure.into(), ());
-
-        Ok(ctx.stash(ex))
-    }) {
-        Ok(ex) => ex,
-        Err(_) => return,
-    };
-
-    // TODO: Limit the amount of fuel the Lua thread can consume.
-    let local_set = LocalSet::new();
-    local_set.spawn_local(async move {
-        const FUEL_STEP: u64 = 256;
-        const MAX_FUEL: u64 = FUEL_STEP * 4096;
-        const MAX_ALLOCATIONS: usize = 1 * 1024 * 1024; // 1MB
-
-        let mut fuel_used = 0;
-        // Drive the Lua executor until completion, waking up on notifications.
-        loop {
-            let mut fuel = Fuel::with(FUEL_STEP as i32);
-
-            let is_finished = lua.enter(|ctx| ctx.fetch(&ex).step(ctx, &mut fuel));
-            // tracing::info!("Lua executor stepped with fuel {FUEL_STEP}, finished: {is_finished:?}");
-            if is_finished {
-                break;
-            } else {
-                if thread.waiters.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-                    thread.next.notified().await;
-                }
-            }
-
-            fuel_used += FUEL_STEP;
-            if fuel_used >= MAX_FUEL {
-                return thread.send_return(Err(LuaExecutionError::FuelLimitExceeded));
-            }
-            if lua.enter(|ctx| ctx.metrics().total_allocation() > MAX_ALLOCATIONS) {
-                return thread.send_return(Err(LuaExecutionError::OutOfMemory));
-            }
-        }
-
-        // Once finished, fetch the return value(s), serialize them to JSON, and send them back.
-        let return_value = match lua.enter(|ctx| {
-            match ctx
-                .fetch(&ex)
-                .take_result::<Variadic<Vec<Value>>>(ctx)
-                .expect("executor should be in finished mode")
-            {
-                Ok(vals) => Ok(vals
-                    .into_iter()
-                    .map(|v| {
-                        tracing::info!("serializing return value {v:?}");
-                        lua::serde::to_json_value(v)
-                    })
-                    .collect::<Result<serde_json::Value, _>>()),
-                Err(e) => Err(Err(LuaExecutionError::PiccoloError(e.into_static()))),
-            }
-        }) {
-            Ok(Ok(json)) => Ok(json),
-            Ok(Err(e)) => Err(LuaExecutionError::SerializationError(e)),
-            Err(Err(e)) => Err(e),
-            Err(Ok(err_val)) => Err(LuaExecutionError::PiccoloError(err_val)),
-        };
-
-        let (has_returned, channel) = &*thread.returned;
-        if has_returned.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            tracing::warn!("Lua thread tried to return a value twice, ignoring second return");
-        } else {
-            channel
-                .send(return_value)
-                .await
-                .expect("failed to send return value");
-        }
-    });
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build runtime")
-        .block_on(local_set)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RunStatelessBody {
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatelessRunRequest {
     /// Docker image to run the stateless code in.
     image: String,
     /// Lua code describing what steps to perform while executing.
@@ -364,110 +77,301 @@ pub struct RunStatelessBody {
 #[axum::debug_handler]
 pub async fn run_stateless(
     state: State<AppState>,
-    Json(body): Json<RunStatelessBody>,
+    Json(body): Json<StatelessRunRequest>,
 ) -> Json<StatelessRunResponse> {
-    let (commands_tx, mut commands_rx) = mpsc::channel::<ActorCommand>(16);
-
-    let container = state
-        .runtime()
-        .create(
-            body.image,
-            JailConfig {
-                ..Default::default()
-            },
-        )
+    let response = state
+        .stateless_workers()
+        .enqueue(body)
         .await
-        .expect("failed to create jail for stateless execution");
+        .expect("failed to enqueue stateless job");
 
-    let (returned_tx, mut returned_rx) = mpsc::channel(1);
-    let thread_ctx = LuaThreadCtx {
-        commands: commands_tx.clone(),
-        returned: Arc::new((AtomicBool::new(false), returned_tx)),
-        next: Arc::new(Notify::new()),
-        waiters: Arc::new(AtomicUsize::new(0)),
+    Json(response)
+}
+
+#[derive(Debug)]
+pub struct StatelessRunCommand {
+    pub req: StatelessRunRequest,
+    chan: oneshot::Sender<StatelessRunResponse>,
+}
+
+impl StatelessRunCommand {
+    /// Send a response back to the requester.
+    pub fn reply(self, response: StatelessRunResponse) -> anyhow::Result<()> {
+        self.chan.send(response).ok();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct StatelessWorkers {
+    queue: mpsc::Sender<StatelessRunCommand>,
+}
+
+/// Information provided to Deno ops for stateless jobs.
+#[derive(Debug)]
+struct JsCtx {
+    pub jail: Jail,
+    pub output: Vec<serde_json::Value>,
+}
+
+/// A macro to simplify accessing the JsCtx from an OpState.
+macro_rules! js_ctx {
+    ($ctx:ident, &$state:ident) => {
+        let _state = $state.borrow();
+        let $ctx = _state.borrow::<JsCtx>();
     };
-    std::thread::spawn(move || start_lua_thread(thread_ctx, body.instructions));
+    ($ctx:ident, &mut $state:ident) => {
+        let mut _state = $state.borrow_mut();
+        let $ctx = _state.borrow_mut::<JsCtx>();
+    };
+}
 
-    let mut tasks = tokio::task::JoinSet::new();
+impl StatelessWorkers {
+    pub fn new(runtime: &StrangerRuntime) -> Self {
+        let (tx, rx) = mpsc::channel::<StatelessRunCommand>(64 * 1024);
 
-    let mut response_value = None;
-    // In the actor, wait for commands and execute them until the Lua execution is finished.
-    loop {
-        tokio::select! {
-            command = commands_rx.recv() => {
-                match command {
-                    Some(ActorCommand::Sh { command, ctx }) => {
-                        let container = container.clone();
-                        tasks.spawn(async move {
-                            tracing::info!("received Sh command, executing...");
-                            let mut exec = container
-                                .sh(command)
-                                .await
-                                .expect("failed to create sh exec");
-                            let (stdout, stderr) = exec
-                                .output()
-                                .all_split()
-                                .await
-                                .expect("failed to get output from sh exec");
-                            let exit_code = exec.exit_code().expect("failed to get exit code");
+        /// Runs a stateless job in a new Deno runtime.
+        async fn run_job(
+            runtime: &StrangerRuntime,
+            req: &StatelessRunRequest,
+        ) -> Result<StatelessRunSuccess, StatelessRunError> {
+            std::thread_local! {
+                pub static KILL_SIGNAL: CancellationToken = CancellationToken::new();
+            }
 
-                            tracing::info!("sh command completed with exit code {}", exit_code);
+            let container = runtime
+                .create(&req.image, JailConfig::default())
+                .await
+                .map_err(|e| {
+                    tracing::warn!("failed to create jail for stateless job: {e:?}");
+                    StatelessRunError::JailCreationError
+                })?;
 
-                            ctx.finish((exit_code, stdout, stderr));
-                        });
-                    }
-                    None => {
-                        tracing::info!("command channel closed, exiting actor loop");
-                        break;
-                    }
+            #[deno_core::op2(async)]
+            async fn op_sleep(state: Rc<RefCell<OpState>>, #[smi] millis: u32) {
+                state.borrow_mut().borrow_mut::<JsCtx>();
+                tokio::time::sleep(std::time::Duration::from_millis(millis as u64)).await;
+            }
+
+            #[derive(Debug, thiserror::Error, deno_error::JsError)]
+            #[class(generic)]
+            pub enum StatelessJsError {
+                #[error("run failed: {message}")]
+                RunFailed { message: String },
+            }
+
+            #[derive(Debug, Serialize)]
+            pub struct RunResults {
+                pub exit_code: u8,
+                pub stdout: String,
+                pub stderr: String,
+            }
+
+            #[tracing::instrument(name = "stateless_run", skip(state))]
+            #[deno_core::op2(async)]
+            #[serde]
+            async fn op_run(
+                state: Rc<RefCell<OpState>>,
+                #[string] code: String,
+            ) -> Result<RunResults, StatelessJsError> {
+                js_ctx!(ctx, &state);
+                let mut result =
+                    ctx.jail
+                        .sh(&code)
+                        .await
+                        .map_err(|e| StatelessJsError::RunFailed {
+                            message: format!("{}", e),
+                        })?;
+
+                let (stdout, stderr) =
+                    result
+                        .output()
+                        .all_split()
+                        .await
+                        .map_err(|e| StatelessJsError::RunFailed {
+                            message: format!("failed to get output: {}", e),
+                        })?;
+                let exit_code = result
+                    .exit_code()
+                    .ok_or_else(|| StatelessJsError::RunFailed {
+                        message: "process did not exit normally".to_string(),
+                    })?;
+
+                Ok(RunResults {
+                    exit_code,
+                    stdout,
+                    stderr,
+                })
+            }
+
+            #[deno_core::op2]
+            fn op_output(state: Rc<RefCell<OpState>>, #[serde] output: serde_json::Value) {
+                js_ctx!(ctx, &mut state);
+                ctx.output.push(output);
+            }
+
+            #[deno_core::op2(fast)]
+            fn op_print(#[string] msg: String) {
+                tracing::info!("[stateless worker] {}", msg.trim());
+            }
+
+            fn middleware(op: OpDecl) -> OpDecl {
+                if op.name == "op_print" {
+                    op.with_implementation_from(&op_print())
+                } else {
+                    op
                 }
             }
-            Some(return_value) = returned_rx.recv() => {
-                tracing::info!("Lua thread has finished execution with return value {return_value:?}");
-                response_value = Some(match return_value {
-                    Ok(json) => StatelessRunResponse::Success { output: json },
-                    Err(LuaExecutionError::ParsingError(e)) => {
-                        StatelessRunResponse::Error(StatelessRunError::ParsingError {
-                            message: format!("{e}"),
-                        })
-                    },
-                    Err(LuaExecutionError::CompilerError(e)) => {
-                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
-                            message: format!("{e}"),
-                        })
-                    },
-                    Err(LuaExecutionError::FuelLimitExceeded) => {
-                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
-                            message: "fuel limit exceeded".to_string(),
-                        })
-                    },
-                    Err(LuaExecutionError::OutOfMemory) => {
-                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
-                            message: "out of memory".to_string(),
-                        })
-                    },
-                    Err(LuaExecutionError::SerializationError(e)) => {
-                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
-                            message: format!("serialization error: {e}"),
-                        })
-                    },
-                    Err(LuaExecutionError::PiccoloError(e)) => {
-                        StatelessRunResponse::Error(StatelessRunError::ExecutionError {
-                            message: format!("runtime error: {e}"),
-                        })
-                    },
-                });
-                break
-            }
-        }
-    }
-    container.destroy().await.expect("failed to destroy jail");
-    tasks.shutdown().await;
 
-    match response_value {
-        Some(val) => Json(val),
-        None => Json(StatelessRunResponse::Error(
-            StatelessRunError::TimeLimitExceeded,
-        )),
+            deno_core::extension!(
+                stranger_ops,
+                ops = [op_sleep, op_run, op_output],
+                js = ["00_helpers.js"],
+                middleware = middleware,
+            );
+
+            const INITIAL_HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+            const MAX_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+            let mut runtime = JsRuntime::new(RuntimeOptions {
+                create_params: Some(
+                    CreateParams::default().heap_limits(INITIAL_HEAP_SIZE, MAX_HEAP_SIZE),
+                ),
+                extensions: vec![stranger_ops::init()],
+                ..Default::default()
+            });
+            unsafe extern "C" fn oom_handler(location: *const i8, details: &OomDetails) {
+                tracing::error!("JavaScript OOM. STOP RUNNING CODE!");
+                KILL_SIGNAL.with(|token| {
+                    token.cancel();
+                });
+            }
+            runtime.v8_isolate().set_oom_error_handler(oom_handler);
+
+            let module = runtime
+                .load_main_es_module_from_code(
+                    &ModuleSpecifier::parse("file://anonymous").expect("failed to parse url"),
+                    req.instructions.clone(),
+                )
+                .await
+                .map_err(|e| match e.into_kind() {
+                    CoreErrorKind::Js(msg) => StatelessRunError::ParsingError {
+                        message: format!("{}", msg),
+                    },
+                    e => {
+                        tracing::error!("unknown error during module loading: {:?}", e);
+                        StatelessRunError::Unknown
+                    }
+                })?;
+            runtime.op_state().borrow_mut().put(JsCtx {
+                jail: container.clone(),
+                output: Vec::new(),
+            });
+
+            tracing::info!("starting module evaluation...");
+            let kill_token = KILL_SIGNAL.with(|s| s.clone());
+            let module_evaluate = runtime.mod_evaluate(module);
+            tokio::select! {
+                biased;
+                _ = kill_token.cancelled() => {
+                    tracing::warn!("stateless job killed due to OOM");
+                    return Err(StatelessRunError::TimeLimitExceeded);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    tracing::warn!("stateless job time limit exceeded");
+                    return Err(StatelessRunError::TimeLimitExceeded);
+                }
+                _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {},
+                res = module_evaluate => {
+                    res.map_err(|e| match e.into_kind() {
+                        CoreErrorKind::Js(msg) => StatelessRunError::ParsingError {
+                            message: format!("{}", msg),
+                        },
+                        e => {
+                            tracing::error!("unknown error during module evaluation: {:?}", e);
+                            StatelessRunError::Unknown
+                        }
+                    })?;
+                }
+            }
+            tracing::info!("module evaluation done!");
+
+            let result = runtime
+                .run_event_loop(PollEventLoopOptions::default())
+                .await
+                .map_err(|e| match e.into_kind() {
+                    CoreErrorKind::Js(msg) => StatelessRunError::ExecutionError {
+                        message: format!("{}", msg),
+                    },
+                    e => {
+                        tracing::error!("unknown error during event loop: {:?}", e);
+                        StatelessRunError::Unknown
+                    }
+                })?;
+            tracing::info!("job completed with result: {:?}", result);
+
+            if let Err(e) = container.destroy().await {
+                tracing::warn!("failed to destroy jail for stateless job: {e:?}");
+            }
+
+            Ok(StatelessRunSuccess {
+                output: runtime.op_state().borrow_mut().take::<JsCtx>().output,
+            })
+        }
+
+        #[tracing::instrument(name = "stateless_worker", skip(rx, runtime))]
+        async fn run_stateless_worker(
+            id: u8,
+            runtime: StrangerRuntime,
+            mut rx: mpsc::Receiver<StatelessRunCommand>,
+        ) -> Result<(), anyhow::Error> {
+            tracing::info!("stateless worker started. waiting for jobs...");
+
+            while let Some(job) = rx.recv().await {
+                tracing::info!("processing job {:?}", job.req);
+                let result = run_job(&runtime, &job.req).await;
+                if let Err(e) = job.reply(match result {
+                    Ok(success) => StatelessRunResponse::Success(success),
+                    Err(error) => StatelessRunResponse::Error(error),
+                }) {
+                    tracing::error!("failed to send job response: {:?}", e);
+                }
+            }
+
+            Ok(())
+        }
+
+        // TODO: respawn workers on failure and run multiple workers
+        let runtime = runtime.clone();
+        std::thread::spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build stateless worker runtime")
+                .block_on(run_stateless_worker(0, runtime, rx))
+            {
+                Ok(_) => (),
+                Err(e) => tracing::error!("stateless worker exited with error: {:?}", e),
+            }
+        });
+
+        Self { queue: tx }
+    }
+
+    /// Enqueue a stateless job for processing and wait for the result.
+    pub async fn enqueue(&self, job: StatelessRunRequest) -> anyhow::Result<StatelessRunResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.queue
+            .send(StatelessRunCommand { req: job, chan: tx })
+            .await
+            .context("failed to enqueue stateless job")?;
+
+        Ok(rx
+            .await
+            .context("failed to receive stateless job response")?)
+    }
+}
+impl AppState {
+    pub fn stateless_workers(&self) -> &StatelessWorkers {
+        &self.inner.stateless_workers
     }
 }

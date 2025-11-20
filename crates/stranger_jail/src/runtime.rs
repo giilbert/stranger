@@ -134,7 +134,8 @@ impl StrangerRuntime {
     }
 
     /// Create a new [`Jail`] managed by this runtime.
-    pub async fn create(&self, image: String, config: JailConfig) -> anyhow::Result<Jail> {
+    pub async fn create(&self, image: impl ToString, config: JailConfig) -> anyhow::Result<Jail> {
+        let image = image.to_string();
         let jail = Jail::new(self, image, config).await?;
 
         self.inner

@@ -4,17 +4,20 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use stranger_jail::{StrangerConfig, StrangerRuntime};
 
+use crate::api::stateless::StatelessWorkers;
+
 #[derive(Debug, Clone)]
 pub struct AppState {
-    inner: Arc<AppStateInner>,
+    pub(crate) inner: Arc<AppStateInner>,
 }
 
 #[derive(Debug)]
-struct AppStateInner {
+pub(crate) struct AppStateInner {
     environment: Environment,
     config_directory: PathBuf,
     config: StrangerApiServerConfig,
     runtime: StrangerRuntime,
+    pub(super) stateless_workers: StatelessWorkers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +73,7 @@ impl AppState {
 
         Ok(Self {
             inner: Arc::new(AppStateInner {
+                stateless_workers: StatelessWorkers::new(&runtime),
                 runtime,
                 config_directory,
                 config,
