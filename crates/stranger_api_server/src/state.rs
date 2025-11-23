@@ -73,7 +73,8 @@ impl AppState {
 
         Ok(Self {
             inner: Arc::new(AppStateInner {
-                stateless_workers: StatelessWorkers::new(&runtime),
+                stateless_workers: StatelessWorkers::new(&runtime)
+                    .context("failed to create stateless workers")?,
                 runtime,
                 config_directory,
                 config,

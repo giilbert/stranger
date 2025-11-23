@@ -1912,6 +1912,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "dotenvy",
+ "futures-util",
  "parking_lot",
  "process-fun",
  "serde",
@@ -1926,10 +1927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "stranger_api_server_worker"
-version = "0.1.0"
-
-[[package]]
 name = "stranger_jail"
 version = "0.1.0"
 dependencies = [
@@ -1939,6 +1936,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",

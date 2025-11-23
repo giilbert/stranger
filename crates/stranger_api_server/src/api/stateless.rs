@@ -1,33 +1,35 @@
-use std::{cell::RefCell, rc::Rc};
+use std::process::Stdio;
 
 use anyhow::Context;
 use axum::{Json, extract::State};
-use deno_core::{
-    JsRuntime, ModuleSpecifier, OpDecl, OpState, PollEventLoopOptions, RuntimeOptions,
-    error::CoreErrorKind,
-    v8::{CreateParams, OomDetails},
-};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use stranger_jail::{Jail, JailConfig, StrangerRuntime};
-use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio::{
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::{Mutex, mpsc, oneshot},
+};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
-use crate::state::AppState;
+use crate::{
+    api::worker::{StatelessHostCommand, StatelessWorkerCommand},
+    state::AppState,
+};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum StatelessRunResponse {
     Success(StatelessRunSuccess),
     Error(StatelessRunError),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatelessRunSuccess {
     pub output: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StatelessRunError {
     #[error("unable to create jail")]
@@ -42,6 +44,9 @@ pub enum StatelessRunError {
     #[error("time limit exceeded")]
     #[serde(rename = "TIME_LIMIT_EXCEEDED")]
     TimeLimitExceeded,
+    #[error("memory limit exceeded")]
+    #[serde(rename = "MEMORY_LIMIT_EXCEEDED")]
+    MemoryLimitExceeded,
     #[error("unknown error")]
     #[serde(rename = "UNKNOWN")]
     Unknown,
@@ -65,12 +70,12 @@ impl StatelessRunError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatelessRunRequest {
     /// Docker image to run the stateless code in.
-    image: String,
+    pub image: String,
     /// Lua code describing what steps to perform while executing.
-    instructions: String,
+    pub instructions: String,
 }
 
 /// POST /v1/stateless/run
@@ -90,7 +95,7 @@ pub async fn run_stateless(
 
 #[derive(Debug)]
 pub struct StatelessRunCommand {
-    pub req: StatelessRunRequest,
+    pub req: Option<StatelessRunRequest>,
     chan: oneshot::Sender<StatelessRunResponse>,
 }
 
@@ -107,261 +112,220 @@ pub struct StatelessWorkers {
     queue: mpsc::Sender<StatelessRunCommand>,
 }
 
-/// Information provided to Deno ops for stateless jobs.
-#[derive(Debug)]
-struct JsCtx {
-    pub jail: Jail,
-    pub output: Vec<serde_json::Value>,
+struct StatelessRunWorker {
+    req: Option<StatelessRunRequest>,
+    jail: Jail,
+    child: Child,
+    stdin: Mutex<FramedWrite<ChildStdin, LinesCodec>>,
+    stdout: FramedRead<ChildStdout, LinesCodec>,
+    stderr: FramedRead<ChildStderr, LinesCodec>,
 }
 
-/// A macro to simplify accessing the JsCtx from an OpState.
-macro_rules! js_ctx {
-    ($ctx:ident, &$state:ident) => {
-        let _state = $state.borrow();
-        let $ctx = _state.borrow::<JsCtx>();
-    };
-    ($ctx:ident, &mut $state:ident) => {
-        let mut _state = $state.borrow_mut();
-        let $ctx = _state.borrow_mut::<JsCtx>();
-    };
+impl StatelessRunWorker {
+    pub async fn new(runtime: &StrangerRuntime, req: StatelessRunRequest) -> anyhow::Result<Self> {
+        // Spawn a Jail for this stateless run worker
+        let jail = runtime
+            .create(req.image.clone(), JailConfig::default())
+            .await
+            .context("failed to create jail for stateless job")?;
+
+        let mut child =
+            Command::new(std::env::current_exe().expect("failed to get current executable"))
+                .arg("worker")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::piped())
+                .env_clear()
+                .env("RUST_LOG", "stranger_jail=debug,stranger_api_server=debug")
+                .spawn()
+                .context("failed to spawn stateless worker process")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open stdin for stateless worker process"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open stdout for stateless worker process"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open stderr for stateless worker process"))?;
+
+        Ok(Self {
+            req: Some(req),
+            jail,
+            child,
+            stdin: Mutex::new(FramedWrite::new(stdin, LinesCodec::new())),
+            stdout: FramedRead::new(stdout, LinesCodec::new()),
+            stderr: FramedRead::new(stderr, LinesCodec::new()),
+        })
+    }
+
+    async fn send(&self, command: StatelessWorkerCommand) -> anyhow::Result<()> {
+        self.stdin
+            .lock()
+            .await
+            .send(serde_json::to_string(&command)?)
+            .await
+            .context("failed to send command to stateless worker")
+    }
+
+    async fn handle_command(
+        &self,
+        line: Result<String, LinesCodecError>,
+    ) -> anyhow::Result<Option<StatelessRunResponse>> {
+        match line {
+            Err(e) => {
+                tracing::error!("failed to read line from stateless worker stdout: {:?}", e);
+            }
+            Ok(line) => {
+                let command: StatelessHostCommand = match serde_json::from_str(&line) {
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to parse stateless worker host command from line `{line}`: {:?}",
+                            e
+                        );
+                        return Ok(None);
+                    }
+                    Ok(cmd) => cmd,
+                };
+                match command {
+                    StatelessHostCommand::Debug(message) => {
+                        tracing::debug!("worker: {}", message);
+                    }
+                    StatelessHostCommand::RunResponse(response) => {
+                        return Ok(Some(response));
+                    }
+                    StatelessHostCommand::Jail(jail_command) => {
+                        // tracing::debug!("forwarding jail command to jail: {:?}", jail_command);
+                        let _ = self.jail.commands().send(jail_command).await;
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<StatelessRunResponse> {
+        tracing::debug!("starting stateless worker run loop");
+
+        let mut responses = self.jail.responses().ok_or_else(|| {
+            anyhow::anyhow!("failed to take jail responses receiver for stateless worker")
+        })?;
+
+        let req = self.req.take().expect("run cannot be called twice");
+        self.send(StatelessWorkerCommand::Run(req))
+            .await
+            .context("failed to send run command to stateless worker")?;
+
+        loop {
+            tokio::select! {
+                status = self.child.wait() => {
+                    match status {
+                        Err(e) => {
+                            anyhow::bail!("failed to wait for stateless worker process: {:?}", e)
+                        }
+                        Ok(status) => {
+                            tracing::info!("stateless worker process exited with status: {status}");
+                            if !status.success() {
+                                anyhow::bail!(
+                                    "stateless worker process exited with status: {status}"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Forward jail command responses to the worker
+                Some(response) = responses.recv() => {
+                    // tracing::debug!("forwarding jail command response to worker: {:?}", response);
+                    let _ = self.send(StatelessWorkerCommand::JailResponse(response)).await;
+                }
+                // Handle commands from the worker's stdout
+                Some(line) = self.stdout.next() => {
+                    if let Some(response) = self.handle_command(line).await? {
+                        return Ok(response);
+                    }
+                }
+                Some(line) = self.stderr.next() => {
+                    match line {
+                        Err(e) => {
+                            tracing::error!("failed to read line from stateless worker stderr: {:?}", e);
+                        }
+                        Ok(line) => {
+                            tracing::error!("worker: {}", line);
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    pub async fn cleanup(&self) {
+        if let Err(e) = self.jail.destroy().await {
+            tracing::error!("failed to destroy jail for stateless worker: {:?}", e);
+        }
+    }
 }
 
 impl StatelessWorkers {
-    pub fn new(runtime: &StrangerRuntime) -> Self {
-        let (tx, rx) = mpsc::channel::<StatelessRunCommand>(64 * 1024);
+    pub fn new(runtime: &StrangerRuntime) -> anyhow::Result<Self> {
+        let (tx, mut rx) = mpsc::channel::<StatelessRunCommand>(64 * 1024);
 
-        /// Runs a stateless job in a new Deno runtime.
-        async fn run_job(
-            runtime: &StrangerRuntime,
-            req: &StatelessRunRequest,
-        ) -> Result<StatelessRunSuccess, StatelessRunError> {
-            std::thread_local! {
-                pub static KILL_SIGNAL: CancellationToken = CancellationToken::new();
-            }
+        let runtime_handle = runtime.clone();
+        tokio::spawn(async move {
+            async fn run_job(
+                runtime: &StrangerRuntime,
+                req: StatelessRunRequest,
+            ) -> Result<StatelessRunSuccess, StatelessRunError> {
+                let mut worker = StatelessRunWorker::new(&runtime, req)
+                    .await
+                    .map_err(|_| StatelessRunError::JailCreationError)?;
 
-            let container = runtime
-                .create(&req.image, JailConfig::default())
-                .await
-                .map_err(|e| {
-                    tracing::warn!("failed to create jail for stateless job: {e:?}");
-                    StatelessRunError::JailCreationError
-                })?;
+                let res = worker.run().await;
+                worker.cleanup().await;
 
-            #[deno_core::op2(async)]
-            async fn op_sleep(state: Rc<RefCell<OpState>>, #[smi] millis: u32) {
-                state.borrow_mut().borrow_mut::<JsCtx>();
-                tokio::time::sleep(std::time::Duration::from_millis(millis as u64)).await;
-            }
-
-            #[derive(Debug, thiserror::Error, deno_error::JsError)]
-            #[class(generic)]
-            pub enum StatelessJsError {
-                #[error("run failed: {message}")]
-                RunFailed { message: String },
-            }
-
-            #[derive(Debug, Serialize)]
-            pub struct RunResults {
-                pub exit_code: u8,
-                pub stdout: String,
-                pub stderr: String,
-            }
-
-            #[tracing::instrument(name = "stateless_run", skip(state))]
-            #[deno_core::op2(async)]
-            #[serde]
-            async fn op_run(
-                state: Rc<RefCell<OpState>>,
-                #[string] code: String,
-            ) -> Result<RunResults, StatelessJsError> {
-                js_ctx!(ctx, &state);
-                let mut result =
-                    ctx.jail
-                        .sh(&code)
-                        .await
-                        .map_err(|e| StatelessJsError::RunFailed {
-                            message: format!("{}", e),
-                        })?;
-
-                let (stdout, stderr) =
-                    result
-                        .output()
-                        .all_split()
-                        .await
-                        .map_err(|e| StatelessJsError::RunFailed {
-                            message: format!("failed to get output: {}", e),
-                        })?;
-                let exit_code = result
-                    .exit_code()
-                    .ok_or_else(|| StatelessJsError::RunFailed {
-                        message: "process did not exit normally".to_string(),
-                    })?;
-
-                Ok(RunResults {
-                    exit_code,
-                    stdout,
-                    stderr,
-                })
-            }
-
-            #[deno_core::op2]
-            fn op_output(state: Rc<RefCell<OpState>>, #[serde] output: serde_json::Value) {
-                js_ctx!(ctx, &mut state);
-                ctx.output.push(output);
-            }
-
-            #[deno_core::op2(fast)]
-            fn op_print(#[string] msg: String) {
-                tracing::info!("[stateless worker] {}", msg.trim());
-            }
-
-            fn middleware(op: OpDecl) -> OpDecl {
-                if op.name == "op_print" {
-                    op.with_implementation_from(&op_print())
-                } else {
-                    op
+                match res {
+                    Ok(StatelessRunResponse::Success(success)) => Ok(success),
+                    Ok(StatelessRunResponse::Error(error)) => Err(error),
+                    Err(e) => Err(StatelessRunError::ExecutionError {
+                        message: format!("{}", e),
+                    }),
                 }
             }
 
-            deno_core::extension!(
-                stranger_ops,
-                ops = [op_sleep, op_run, op_output],
-                js = ["00_helpers.js"],
-                middleware = middleware,
-            );
-
-            const INITIAL_HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
-            const MAX_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-            let mut runtime = JsRuntime::new(RuntimeOptions {
-                create_params: Some(
-                    CreateParams::default().heap_limits(INITIAL_HEAP_SIZE, MAX_HEAP_SIZE),
-                ),
-                extensions: vec![stranger_ops::init()],
-                ..Default::default()
-            });
-            unsafe extern "C" fn oom_handler(location: *const i8, details: &OomDetails) {
-                tracing::error!("JavaScript OOM. STOP RUNNING CODE!");
-                KILL_SIGNAL.with(|token| {
-                    token.cancel();
-                });
-            }
-            runtime.v8_isolate().set_oom_error_handler(oom_handler);
-
-            let module = runtime
-                .load_main_es_module_from_code(
-                    &ModuleSpecifier::parse("file://anonymous").expect("failed to parse url"),
-                    req.instructions.clone(),
+            // Process incoming stateless job commands and run them
+            while let Some(mut command) = rx.recv().await {
+                let result = run_job(
+                    &runtime_handle,
+                    command
+                        .req
+                        .take()
+                        .expect("command.req has already been consumed"),
                 )
-                .await
-                .map_err(|e| match e.into_kind() {
-                    CoreErrorKind::Js(msg) => StatelessRunError::ParsingError {
-                        message: format!("{}", msg),
-                    },
-                    e => {
-                        tracing::error!("unknown error during module loading: {:?}", e);
-                        StatelessRunError::Unknown
-                    }
-                })?;
-            runtime.op_state().borrow_mut().put(JsCtx {
-                jail: container.clone(),
-                output: Vec::new(),
-            });
-
-            tracing::info!("starting module evaluation...");
-            let kill_token = KILL_SIGNAL.with(|s| s.clone());
-            let module_evaluate = runtime.mod_evaluate(module);
-            tokio::select! {
-                biased;
-                _ = kill_token.cancelled() => {
-                    tracing::warn!("stateless job killed due to OOM");
-                    return Err(StatelessRunError::TimeLimitExceeded);
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    tracing::warn!("stateless job time limit exceeded");
-                    return Err(StatelessRunError::TimeLimitExceeded);
-                }
-                _ = runtime.run_event_loop(PollEventLoopOptions::default()) => {},
-                res = module_evaluate => {
-                    res.map_err(|e| match e.into_kind() {
-                        CoreErrorKind::Js(msg) => StatelessRunError::ParsingError {
-                            message: format!("{}", msg),
-                        },
-                        e => {
-                            tracing::error!("unknown error during module evaluation: {:?}", e);
-                            StatelessRunError::Unknown
-                        }
-                    })?;
-                }
-            }
-            tracing::info!("module evaluation done!");
-
-            let result = runtime
-                .run_event_loop(PollEventLoopOptions::default())
-                .await
-                .map_err(|e| match e.into_kind() {
-                    CoreErrorKind::Js(msg) => StatelessRunError::ExecutionError {
-                        message: format!("{}", msg),
-                    },
-                    e => {
-                        tracing::error!("unknown error during event loop: {:?}", e);
-                        StatelessRunError::Unknown
-                    }
-                })?;
-            tracing::info!("job completed with result: {:?}", result);
-
-            if let Err(e) = container.destroy().await {
-                tracing::warn!("failed to destroy jail for stateless job: {e:?}");
-            }
-
-            Ok(StatelessRunSuccess {
-                output: runtime.op_state().borrow_mut().take::<JsCtx>().output,
-            })
-        }
-
-        #[tracing::instrument(name = "stateless_worker", skip(rx, runtime))]
-        async fn run_stateless_worker(
-            id: u8,
-            runtime: StrangerRuntime,
-            mut rx: mpsc::Receiver<StatelessRunCommand>,
-        ) -> Result<(), anyhow::Error> {
-            tracing::info!("stateless worker started. waiting for jobs...");
-
-            while let Some(job) = rx.recv().await {
-                tracing::info!("processing job {:?}", job.req);
-                let result = run_job(&runtime, &job.req).await;
-                if let Err(e) = job.reply(match result {
+                .await;
+                if let Err(e) = command.reply(match result {
                     Ok(success) => StatelessRunResponse::Success(success),
                     Err(error) => StatelessRunResponse::Error(error),
                 }) {
-                    tracing::error!("failed to send job response: {:?}", e);
+                    tracing::warn!("failed to send stateless job response: {:?}", e);
                 }
-            }
-
-            Ok(())
-        }
-
-        // TODO: respawn workers on failure and run multiple workers
-        let runtime = runtime.clone();
-        std::thread::spawn(move || {
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build stateless worker runtime")
-                .block_on(run_stateless_worker(0, runtime, rx))
-            {
-                Ok(_) => (),
-                Err(e) => tracing::error!("stateless worker exited with error: {:?}", e),
             }
         });
 
-        Self { queue: tx }
+        Ok(Self { queue: tx })
     }
 
     /// Enqueue a stateless job for processing and wait for the result.
     pub async fn enqueue(&self, job: StatelessRunRequest) -> anyhow::Result<StatelessRunResponse> {
         let (tx, rx) = oneshot::channel();
         self.queue
-            .send(StatelessRunCommand { req: job, chan: tx })
+            .send(StatelessRunCommand {
+                req: Some(job),
+                chan: tx,
+            })
             .await
             .context("failed to enqueue stateless job")?;
 

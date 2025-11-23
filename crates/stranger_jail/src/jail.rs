@@ -8,13 +8,16 @@ use bollard::{
     },
     secret::{ContainerCreateBody, HostConfig},
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use tokio::time;
+use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::runtime::StrangerRuntime;
+use crate::{
+    commands::{JailCommand, JailCommandResponse},
+    runtime::StrangerRuntime,
+};
 
 /// Internal actor for managing the jail's state and operations.
 ///
@@ -26,6 +29,13 @@ pub(crate) struct JailActor {
 
     pub(crate) _config: JailConfig,
     pub(crate) runtime: StrangerRuntime,
+
+    /// Used by other tasks to send commands to the jail.
+    pub(crate) commands_tx: mpsc::Sender<JailCommand>,
+    pub(crate) commands_rx: Mutex<Option<mpsc::Receiver<JailCommand>>>,
+    /// A response channel for receiving command responses from the jail. This is meant to be taken.
+    pub(crate) response_rx: Mutex<Option<mpsc::Receiver<JailCommandResponse>>>,
+    pub(crate) response_tx: mpsc::Sender<JailCommandResponse>,
 
     /// Used to signal that the jail should stop responding to events and clean up resources.
     pub(crate) cancellation_token: CancellationToken,
@@ -90,6 +100,11 @@ impl JailActor {
         image: String,
         config: JailConfig,
     ) -> anyhow::Result<Self> {
+        const COMMAND_BUFFER_LENGTH: usize = 64;
+
+        let (commands_tx, commands_rx) = mpsc::channel::<JailCommand>(COMMAND_BUFFER_LENGTH);
+        let (response_tx, response_rx) =
+            mpsc::channel::<JailCommandResponse>(COMMAND_BUFFER_LENGTH);
         let cancellation_token = CancellationToken::new();
         let id = Uuid::new_v4();
 
@@ -161,6 +176,10 @@ impl JailActor {
             status: RwLock::new(JailStatus::Running),
             _config: config,
             runtime: runtime.clone(),
+            commands_tx,
+            commands_rx: Mutex::new(Some(commands_rx)),
+            response_tx,
+            response_rx: Mutex::new(Some(response_rx)),
             cancellation_token,
             destroyed_token: CancellationToken::new(),
         })
@@ -177,15 +196,25 @@ impl JailActor {
     /// stop responding to events and clean up resources.
     pub(crate) async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let mut check_disk_usage_interval = time::interval(Duration::from_secs(1));
+        let mut commands_rx = self
+            .take_commands()
+            .context("failed to take commands receiver")?;
 
         loop {
             tokio::select! {
                 biased;
                 _ = self.cancellation_token.cancelled() => break,
+                res = self.clone().handle_command(&mut commands_rx) => {
+                    if let Err(e) = res {
+                        tracing::error!("error running commands in jail {}: {:?}", self.id, e);
+                    }
+                    break;
+                },
                 _ = check_disk_usage_interval.tick() => self.task_check_disk_usage().await?,
             }
         }
 
+        tracing::info!("jail {} is destroyed", self.id);
         self.destroyed_token.cancel();
 
         Ok(())
@@ -283,6 +312,17 @@ impl Jail {
     /// Destroys the jail, stopping and removing its underlying container.
     pub async fn destroy(&self) -> anyhow::Result<()> {
         self.handle.destroy().await
+    }
+
+    /// Returns a sender for sending commands to the jail.
+    pub fn commands(&self) -> &mpsc::Sender<JailCommand> {
+        &self.handle.commands_tx
+    }
+
+    /// Returns a receiver for receiving command responses from the jail. This receiver can only be
+    /// taken once.
+    pub fn responses(&self) -> Option<mpsc::Receiver<JailCommandResponse>> {
+        self.handle.response_rx.lock().take()
     }
 }
 

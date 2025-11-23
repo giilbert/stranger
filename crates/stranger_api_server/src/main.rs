@@ -9,10 +9,25 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use crate::state::AppState;
+use crate::{api::worker::run_worker, state::AppState};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let is_running_worker = std::env::args().any(|arg| arg == "worker");
+    if is_running_worker {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_worker());
+    } else {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(start_api_server());
+    }
+}
+
+/// Start the main API server.
+async fn start_api_server() -> anyhow::Result<()> {
     const DEFAULT_LOG_SETTINGS: &str = "stranger_jail=info,stranger_api_server=info";
     tracing_subscriber::registry()
         .with(fmt::layer())
