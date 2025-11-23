@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::{ops::ControlFlow, process::Stdio};
 
 use anyhow::Context;
 use axum::{Json, extract::State};
@@ -16,12 +16,16 @@ use crate::{
     state::AppState,
 };
 
+/// The response to a stateless run request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum StatelessRunResponse {
     Success(StatelessRunSuccess),
     Error(StatelessRunError),
 }
+
+/// A convenience type for stateless run results.
+pub type StatelessRunResult<T = StatelessRunSuccess> = Result<T, StatelessRunError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,9 +56,16 @@ pub enum StatelessRunError {
     Unknown,
 }
 
+impl From<anyhow::Error> for StatelessRunError {
+    fn from(err: anyhow::Error) -> Self {
+        tracing::error!("misc error: {:?}", err);
+        StatelessRunError::Unknown
+    }
+}
+
 impl StatelessRunError {
     /// Create an [`Option::ok_or_else`] closure that logs the unknown error.
-    pub fn ok_or_else(message: &'static str) -> impl FnOnce() -> Self {
+    pub fn unknown_ok_or_else(message: &'static str) -> impl FnOnce() -> Self {
         move || {
             tracing::error!("unknown error: `{message}`");
             StatelessRunError::Unknown
@@ -62,7 +73,7 @@ impl StatelessRunError {
     }
 
     /// Creates an [`Result::map_err`] closure that logs the unknown error.
-    pub fn map_err<T: std::error::Error>(message: &'static str) -> impl FnOnce(T) -> Self {
+    pub fn unknown_map_err<T: std::fmt::Debug>(message: &'static str) -> impl FnOnce(T) -> Self {
         move |err: T| {
             tracing::error!("unknown error: `{message}`\n{err:?}");
             StatelessRunError::Unknown
@@ -172,10 +183,14 @@ impl StatelessRunWorker {
             .context("failed to send command to stateless worker")
     }
 
+    /// Handle a command sent by the worker process.
+    ///
+    /// ## Returns
+    /// If the command produces a response that should terminate the worker, it is returned here.
     async fn handle_command(
         &self,
         line: Result<String, LinesCodecError>,
-    ) -> anyhow::Result<Option<StatelessRunResponse>> {
+    ) -> ControlFlow<StatelessRunResult> {
         match line {
             Err(e) => {
                 tracing::error!("failed to read line from stateless worker stdout: {:?}", e);
@@ -184,10 +199,10 @@ impl StatelessRunWorker {
                 let command: StatelessHostCommand = match serde_json::from_str(&line) {
                     Err(e) => {
                         tracing::error!(
-                            "failed to parse stateless worker host command from line `{line}`: {:?}",
+                            "failed to parse stateless worker host command from `{line}`: {:?}",
                             e
                         );
-                        return Ok(None);
+                        return ControlFlow::Break(Err(StatelessRunError::Unknown));
                     }
                     Ok(cmd) => cmd,
                 };
@@ -196,66 +211,77 @@ impl StatelessRunWorker {
                         tracing::debug!("worker: {}", message);
                     }
                     StatelessHostCommand::RunResponse(response) => {
-                        return Ok(Some(response));
+                        return ControlFlow::Break(response);
                     }
                     StatelessHostCommand::Jail(jail_command) => {
-                        // tracing::debug!("forwarding jail command to jail: {:?}", jail_command);
                         let _ = self.jail.commands().send(jail_command).await;
                     }
                 }
             }
         }
 
-        Ok(None)
+        ControlFlow::Continue(())
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<StatelessRunResponse> {
-        tracing::debug!("starting stateless worker run loop");
+    #[tracing::instrument(skip(self))]
+    pub async fn run(&mut self) -> Result<StatelessRunSuccess, StatelessRunError> {
+        let mut responses = self
+            .jail
+            .responses()
+            .expect("responses channel has already been taken. did run get called twice?");
 
-        let mut responses = self.jail.responses().ok_or_else(|| {
-            anyhow::anyhow!("failed to take jail responses receiver for stateless worker")
-        })?;
-
-        let req = self.req.take().expect("run cannot be called twice");
-        self.send(StatelessWorkerCommand::Run(req))
+        // Kick off the worker by telling it to run the JavaScript code
+        let request = self
+            .req
+            .take()
+            .expect("request has already been taken. did run get called twice?");
+        self.send(StatelessWorkerCommand::Run(request))
             .await
-            .context("failed to send run command to stateless worker")?;
+            .map_err(StatelessRunError::unknown_map_err(
+                "failed to send run command to stateless worker",
+            ))?;
 
         loop {
             tokio::select! {
                 status = self.child.wait() => {
                     match status {
                         Err(e) => {
-                            anyhow::bail!("failed to wait for stateless worker process: {:?}", e)
+                            return Err(StatelessRunError::ExecutionError {
+                                message: format!(
+                                    "failed to wait for stateless worker process: {}",
+                                    e
+                                ),
+                            });
                         }
                         Ok(status) => {
-                            tracing::info!("stateless worker process exited with status: {status}");
                             if !status.success() {
-                                anyhow::bail!(
-                                    "stateless worker process exited with status: {status}"
-                                );
+                                return Err(StatelessRunError::ExecutionError {
+                                    message: format!(
+                                        "worker exited with non-zero status: {}",
+                                        status
+                                    ),
+                                });
                             }
                         }
                     }
                 }
                 // Forward jail command responses to the worker
                 Some(response) = responses.recv() => {
-                    // tracing::debug!("forwarding jail command response to worker: {:?}", response);
                     let _ = self.send(StatelessWorkerCommand::JailResponse(response)).await;
                 }
                 // Handle commands from the worker's stdout
                 Some(line) = self.stdout.next() => {
-                    if let Some(response) = self.handle_command(line).await? {
-                        return Ok(response);
+                    if let ControlFlow::Break(response) = self.handle_command(line).await {
+                        return response;
                     }
                 }
                 Some(line) = self.stderr.next() => {
                     match line {
                         Err(e) => {
-                            tracing::error!("failed to read line from stateless worker stderr: {:?}", e);
+                            tracing::error!("failed to read from stateless worker stderr: {:?}", e);
                         }
                         Ok(line) => {
-                            tracing::error!("worker: {}", line);
+                            tracing::error!("worker stderr: {}", line);
                         }
                     }
                 }
@@ -279,21 +305,15 @@ impl StatelessWorkers {
             async fn run_job(
                 runtime: &StrangerRuntime,
                 req: StatelessRunRequest,
-            ) -> Result<StatelessRunSuccess, StatelessRunError> {
+            ) -> StatelessRunResult {
                 let mut worker = StatelessRunWorker::new(&runtime, req)
                     .await
                     .map_err(|_| StatelessRunError::JailCreationError)?;
 
-                let res = worker.run().await;
+                let result = worker.run().await;
                 worker.cleanup().await;
 
-                match res {
-                    Ok(StatelessRunResponse::Success(success)) => Ok(success),
-                    Ok(StatelessRunResponse::Error(error)) => Err(error),
-                    Err(e) => Err(StatelessRunError::ExecutionError {
-                        message: format!("{}", e),
-                    }),
-                }
+                result
             }
 
             // Process incoming stateless job commands and run them

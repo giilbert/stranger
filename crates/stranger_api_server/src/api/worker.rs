@@ -21,7 +21,7 @@ use tokio_util::{
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::api::stateless::{
-    StatelessRunError, StatelessRunRequest, StatelessRunResponse, StatelessRunSuccess,
+    StatelessRunError, StatelessRunRequest, StatelessRunResult, StatelessRunSuccess,
 };
 
 // TODO: improve error messages
@@ -72,7 +72,9 @@ macro_rules! js_ctx {
 /// Sent from the host to stateless workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StatelessWorkerCommand {
+    /// Run the JavaScript instructions described in the request.
     Run(StatelessRunRequest),
+    /// A response to a previously sent jail command forwarded from the host.
     JailResponse(JailCommandResponse),
 }
 
@@ -81,7 +83,9 @@ pub enum StatelessWorkerCommand {
 pub enum StatelessHostCommand {
     /// Send a debug message to the host.
     Debug(String),
-    RunResponse(StatelessRunResponse),
+    /// Send a run response to the host.
+    RunResponse(StatelessRunResult),
+    /// Send a jail command to the host.
     Jail(JailCommand),
 }
 
@@ -93,10 +97,7 @@ impl StatelessHostCommand {
 }
 
 /// Runs a stateless job in a new Deno runtime.
-async fn run_job(
-    req: &StatelessRunRequest,
-    jail_response: JailResponseMap,
-) -> Result<StatelessRunSuccess, StatelessRunError> {
+async fn run_job(req: &StatelessRunRequest, jail_response: JailResponseMap) -> StatelessRunResult {
     std::thread_local! {
         pub static KILL_SIGNAL: CancellationToken = CancellationToken::new();
     }
@@ -167,10 +168,7 @@ async fn run_job(
         ..Default::default()
     });
     unsafe extern "C" fn oom_handler(_location: *const i8, _details: &OomDetails) {
-        StatelessHostCommand::RunResponse(StatelessRunResponse::Error(
-            StatelessRunError::MemoryLimitExceeded,
-        ))
-        .send();
+        StatelessHostCommand::RunResponse(Err(StatelessRunError::MemoryLimitExceeded)).send();
         std::process::exit(1);
     }
     runtime.v8_isolate().set_oom_error_handler(oom_handler);
@@ -293,17 +291,18 @@ fn make_custom_writer() -> impl std::io::Write + Send + 'static {
     }
 }
 
+/// Handle a [`StatelessWorkerCommand`] sent by the host.
+///
+/// ## Errors
+/// If the command produces an error, it should be of type [`StatelessRunError`], which will be sent
+/// back to the host and will terminate the worker process.
 async fn handle_command(
     jail_response: JailResponseMap,
     command: StatelessWorkerCommand,
-) -> anyhow::Result<()> {
+) -> StatelessRunResult<()> {
     match command {
         StatelessWorkerCommand::Run(req) => {
-            StatelessHostCommand::RunResponse(match run_job(&req, jail_response).await {
-                Ok(success) => StatelessRunResponse::Success(success),
-                Err(err) => StatelessRunResponse::Error(err),
-            })
-            .send()
+            StatelessHostCommand::RunResponse(run_job(&req, jail_response).await).send()
         }
         StatelessWorkerCommand::JailResponse(res) => {
             jail_response
