@@ -208,7 +208,7 @@ impl StatelessRunWorker {
                 };
                 match command {
                     StatelessHostCommand::Debug(message) => {
-                        tracing::debug!("worker: {}", message);
+                        tracing::trace!("worker: {}", message);
                     }
                     StatelessHostCommand::RunResponse(response) => {
                         return ControlFlow::Break(response);

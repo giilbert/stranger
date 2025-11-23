@@ -208,7 +208,6 @@ impl JailActor {
                     if let Err(e) = res {
                         tracing::error!("error running commands in jail {}: {:?}", self.id, e);
                     }
-                    break;
                 },
                 _ = check_disk_usage_interval.tick() => self.task_check_disk_usage().await?,
             }

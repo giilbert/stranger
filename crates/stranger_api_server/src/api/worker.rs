@@ -50,12 +50,12 @@ impl JsCtx {
         let (tx, rx) = oneshot::channel();
         self.jail_response.borrow_mut().insert(id, tx);
 
-        // tracing::debug!("waiting for jail command response with id {}", id);
+        tracing::debug!("waiting for jail command response with id {}", id);
         let value = rx
             .await
             .map_err(|e| anyhow::anyhow!("failed to receive jail command response: {}", e))?
             .map_err(|e| anyhow::anyhow!("jail command failed: {}", e))?;
-        // tracing::debug!("received jail command response for id {}: {:?}", id, value);
+        tracing::debug!("received jail command response for id {}: {:?}", id, value);
 
         serde_json::from_value(value).context("failed to deserialize jail command response")
     }
@@ -123,7 +123,9 @@ async fn run_job(req: &StatelessRunRequest, jail_response: JailResponseMap) -> S
     ) -> Result<stranger_jail::commands::ShCommandResponse, StatelessJsError> {
         js_ctx!(ctx, &state);
 
-        Ok(ctx
+        tracing::info!("running command in jail: {}", command);
+
+        let res = ctx
             .command(JailCommandKind::Sh { command })
             .await
             .map_err(|e| {
@@ -131,7 +133,11 @@ async fn run_job(req: &StatelessRunRequest, jail_response: JailResponseMap) -> S
                 StatelessJsError::RunFailed {
                     message: format!("{}", e),
                 }
-            })?)
+            })?;
+
+        tracing::info!("command completed with response: {:?}", res);
+
+        Ok(res)
     }
 
     #[deno_core::op2]
